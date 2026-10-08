@@ -628,23 +628,6 @@ fn appearance_sections() -> Vec<Section> {
 fn capture_sections() -> Vec<Section> {
     vec![
         Section {
-            id: "imageOcr",
-            settings: vec![
-                Setting::new("ocr.imageRecognition", Control::ImageOcr).keywords(&[
-                    "ocr",
-                    "image",
-                    "recognition",
-                    "search",
-                    "offline",
-                    "index",
-                    "图片",
-                    "文字",
-                    "识别",
-                    "搜索",
-                ]),
-            ],
-        },
-        Section {
             id: "capture",
             settings: vec![
                 Setting::new("capture.kinds", Control::CaptureKinds)
@@ -888,6 +871,23 @@ fn item_sections() -> Vec<Section> {
 fn data_sections() -> Vec<Section> {
     vec![
         Section {
+            id: "imageOcr",
+            settings: vec![
+                Setting::new("ocr.imageRecognition", Control::ImageOcr).keywords(&[
+                    "ocr",
+                    "image",
+                    "recognition",
+                    "search",
+                    "offline",
+                    "index",
+                    "图片",
+                    "文字",
+                    "识别",
+                    "搜索",
+                ]),
+            ],
+        },
+        Section {
             id: "cleanup",
             settings: vec![
                 Setting::new("history.retention", Control::Retention)
@@ -1072,11 +1072,11 @@ mod tests {
     fn image_ocr_controls_remain_visible_when_disabled() {
         let settings = Settings::default();
         let tabs = tabs(false);
-        let capture = tabs
+        let data = tabs
             .iter()
-            .find(|tab| tab.id == TabId::Capture)
-            .expect("capture tab");
-        let panel = capture
+            .find(|tab| tab.id == TabId::Data)
+            .expect("data tab");
+        let panel = data
             .sections
             .iter()
             .flat_map(|section| &section.settings)

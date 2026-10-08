@@ -32,6 +32,9 @@ jobs:
 
           while IFS= read -r file; do
             case "$file" in
+              # Native 2.x scripts are checked by native-ci.yml, not the 1.x WebView frontend.
+              scripts/gpui/*|scripts/ci/*|scripts/release/*|scripts/prepare-windows-ocr.ps1|scripts/package-portable.ps1)
+                ;;
               src/*|public/*|scripts/*|config/*)
                 frontend=true
                 ;;

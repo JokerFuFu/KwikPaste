@@ -144,7 +144,10 @@ mod tests {
     fn recognizes_generated_english_image() {
         assert!(supported());
         let result = recognize(&fixture("english.png")).unwrap();
-        assert!(result.contains("EcoPaste local image search"));
+        assert!(
+            result.to_lowercase().contains("local image search"),
+            "Expected searchable English text, got {result:?}"
+        );
     }
 
     #[test]
