@@ -79,6 +79,26 @@
     "shortcutInUse": "已被其他程序占用",
     "shortcutNotSet": "未设置"
   },
+  "imageOcr": {
+    "clear": "清除文字索引",
+    "clearContent": "仅清除识别出的文字和待处理队列，并暂停识别。原始图片、剪贴板历史、收藏、备注及分组均保留。需要时可重新索引历史图片。",
+    "clearTitle": "清除图片文字索引？",
+    "cleared": "文字索引已清除，识别已暂停。原始图片和历史记录已保留。",
+    "counts": "图片 {{total}} · 待处理 {{pending}} · 已完成 {{completed}} · 失败 {{failed}}",
+    "disabled": "已关闭文字搜索",
+    "enable": "启用离线图片文字搜索",
+    "error": "图片文字识别：{{message}}",
+    "idle": "识别队列空闲",
+    "indexHistory": "索引历史图片 / 重试失败项",
+    "loading": "正在读取识别状态…",
+    "pause": "暂停识别",
+    "paused": "识别已暂停，已完成结果仍可搜索",
+    "ready": "离线引擎已就绪",
+    "resume": "继续识别",
+    "running": "正在处理图片",
+    "statusUnavailable": "无法读取识别状态",
+    "unavailable": "离线引擎不可用"
+  },
   "lanSync": {
     "connect": {
       "addressPlaceholder": "例如 [fe80::1%12]:41573",
@@ -401,6 +421,9 @@
       "globalShortcuts": {
         "title": "全局快捷键"
       },
+      "imageOcr": {
+        "title": "图片文字识别"
+      },
       "lanContent": {
         "title": "同步内容"
       },
@@ -719,6 +742,12 @@
             "remind": "仅提醒"
           },
           "title": "超出上限时"
+        }
+      },
+      "ocr": {
+        "imageRecognition": {
+          "description": "在本机识别图片中的中文和英文，便于搜索。默认关闭；启用后自动处理新图片，历史图片需手动索引。",
+          "title": "图片文字搜索"
         }
       },
       "organizing": {

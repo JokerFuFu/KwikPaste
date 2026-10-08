@@ -15,7 +15,7 @@ use crate::clipboard::{
 };
 use crate::db::items::{
     clear_items, delete_item, delete_items, find_item_by_id, find_item_id_at,
-    increment_item_use_count, list_item_refs, mark_item_favorite, reorder_item,
+    increment_item_use_count, list_item_refs_with_ocr, mark_item_favorite, reorder_item,
     toggle_item_favorite, toggle_item_pinned, touch_item_last_used, update_item_group,
     update_item_note, ReorderAnchor, ReorderSection,
 };
@@ -633,8 +633,16 @@ impl Core {
     /// 全选 / 区间选择用：按列表同款过滤与排序返回全部匹配记录的 id 与收藏 / 置顶标记。
     pub async fn list_item_refs(&self, query: ClipboardItemQuery) -> Result<Vec<ClipboardItemRef>> {
         let core = self.clone();
-        self.hop(async move { list_item_refs(&core.0.db.pool().await, &query).await })
+        self.hop(async move {
+            let _ocr = core.0.ocr.gate.lock().await;
+            list_item_refs_with_ocr(
+                &core.0.db.pool().await,
+                &query,
+                core.settings().clipboard.ocr.enabled,
+            )
             .await
+        })
+        .await
     }
 
     /// 「打开链接」/「发送邮件」的目标；内容为空时返回 `None`。宿主用系统默认浏览器 / 邮件客户端打开。

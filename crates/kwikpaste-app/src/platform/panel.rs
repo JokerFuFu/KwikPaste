@@ -108,6 +108,10 @@ pub enum PanelCommand {
     /// 非激活窗口上的鼠标按下重新捕获或释放导航键。
     SetInputCapture(bool),
     /// 原生层截获了面板拖动区/缩放边的按下，GPUI 没有机会让弹出菜单自行收起。
+    #[cfg_attr(
+        target_os = "macos",
+        expect(dead_code, reason = "仅 Windows 原生鼠标处理发送此命令")
+    )]
     DismissPopup,
 }
 
@@ -181,7 +185,6 @@ impl Panel {
     }
 
     /// 面板窗口，钩子按键派发用；窗口打开之前为 `None`。
-    #[cfg_attr(target_os = "macos", expect(dead_code, reason = "macOS 不用键盘钩子"))]
     pub fn window(&self) -> Option<AnyWindowHandle> {
         self.window
     }

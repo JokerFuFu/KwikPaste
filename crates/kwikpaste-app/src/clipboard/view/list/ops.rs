@@ -79,6 +79,7 @@ impl ClipboardList {
         let old = &self.settings.clipboard;
         let new = &settings.clipboard;
         let resort = old.content.sort != new.content.sort;
+        let ocr_search_changed = old.ocr.enabled != new.ocr.enabled;
         let refresh = old.display != new.display || old.sensitive != new.sensitive;
         let preview_changed = old.preview != new.preview;
         // 风格、密度、行数、图片高度变了：行高全变，像换排序一样整体重排。
@@ -90,8 +91,11 @@ impl ClipboardList {
         if preview_changed {
             self.preview_settings_changed(cx);
         }
+        if ocr_search_changed {
+            self.selection.reset();
+        }
 
-        if resort || relayout {
+        if resort || relayout || ocr_search_changed {
             self.reload_from_scratch(cx);
         } else if refresh && let Some(request) = self.model.reload_current_range() {
             self.fetch(request, cx);

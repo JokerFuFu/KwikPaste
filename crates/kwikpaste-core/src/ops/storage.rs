@@ -262,6 +262,8 @@ async fn switch_storage_location(
         let _pause = core.watcher_pause.pause_scoped();
         let _upsert = core.upsert_lock.lock().await;
         let _exclusive = core.cleanup.exclusive().await;
+        let _ocr = core.ocr.gate.lock().await;
+        core.ocr.invalidate();
         let switch_error = Mutex::new(None::<AppError>);
 
         core.db
@@ -296,6 +298,7 @@ async fn switch_storage_location(
             delta: SettingsDelta::replaced(),
         });
         core.events.emit(CoreEvent::ClipboardReloaded);
+        core.events.emit(CoreEvent::ImageOcrChanged);
     }
 
     location_result(core).await

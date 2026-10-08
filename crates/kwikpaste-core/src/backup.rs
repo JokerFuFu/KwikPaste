@@ -1177,6 +1177,7 @@ async fn merge_import(
         // 部分备份的设置是 `{}`：没有可合并的，也就不用通知宿主重新应用。
         if patch.as_object().is_none_or(|object| !object.is_empty()) {
             let delta = SettingsDelta::from_patch(&patch);
+            let _ocr = core.ocr.gate.lock().await;
             let next = core.settings.update(patch)?;
             apply_imported_settings(core, next, delta);
             imported_settings = true;
@@ -1212,6 +1213,8 @@ async fn overwrite_import(
         let _pause = core.watcher_pause.pause_scoped();
         let _upsert = core.upsert_lock.lock().await;
         let _exclusive = core.cleanup.exclusive().await;
+        let _ocr = core.ocr.gate.lock().await;
+        core.ocr.invalidate();
 
         let live = crate::db::db_path(&core.paths)?;
         let staged =
@@ -1239,6 +1242,7 @@ async fn overwrite_import(
 
     let imported_settings = settings.is_some();
     if let Some(settings) = settings {
+        let _ocr = core.ocr.gate.lock().await;
         let next = core.settings.replace(settings)?;
         apply_imported_settings(core, next, SettingsDelta::replaced());
     }
@@ -1630,6 +1634,9 @@ fn apply_imported_settings(
     settings: crate::settings::Settings,
     delta: SettingsDelta,
 ) {
+    if delta.touches("clipboard.ocr") {
+        crate::ocr::settings_changed(core);
+    }
     if delta.touches("clipboard.history") {
         clipboard::cleanup::request(core);
     }

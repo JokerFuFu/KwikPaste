@@ -399,6 +399,7 @@ impl ClipboardList {
                     ListUpdate::Cleaned { removed: *removed }
                 }
                 CoreEvent::ClipboardReloaded => ListUpdate::Reloaded,
+                CoreEvent::ImageOcrChanged => ListUpdate::SearchIndexChanged,
                 _ => return,
             };
             list.on_update(update, cx);
@@ -433,7 +434,7 @@ impl ClipboardList {
             UpdateAction::Ignore => false,
         };
         if reset_selection {
-            // 清理、导入之后不再勾着可能已经不存在的记录（1.x `resetChecked`）。
+            // 清理、导入或 OCR 命中变化后，取消不可见记录的勾选并作废旧全选请求。
             self.selection.reset();
         }
         if action != UpdateAction::Ignore {

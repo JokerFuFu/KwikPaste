@@ -65,6 +65,7 @@ Both shortcuts can be changed in preferences. On Windows, KwikPaste can also tak
 
 - Capture clipboard history for plain text, HTML, RTF, images, files, and folders.
 - Search clipboard content and notes with SQLite FTS5.
+- Optional offline image OCR search: Apple Vision on macOS and bundled Tesseract with English and Simplified Chinese models on Windows. Disabled by default; enable, backfill historical images, pause, or clear the derived index in **Preferences › Data › Image text recognition**. Clearing the index preserves original images and history.
 - Filter history by source application and content type.
 - Protect sensitive content by skipping high-confidence secrets such as private keys, service tokens, AWS keys, and JWTs.
 - Preview text, images, and files in a dedicated preview window.

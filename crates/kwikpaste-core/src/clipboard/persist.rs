@@ -50,7 +50,13 @@ pub(crate) async fn store_and_emit(core: &CoreInner, item: &ClipboardItem) -> Re
     let result = {
         let _serial = core.upsert_lock.lock().await;
         let pool = core.db.pool().await;
-        upsert_item(&pool, item).await?
+        let result = upsert_item(&pool, item).await?;
+        if item.kind == crate::db::models::ClipboardKind::Image {
+            if let Err(err) = crate::ocr::on_capture(core, &pool, &result.id).await {
+                log::warn!("image OCR enqueue failed: {err}");
+            }
+        }
+        result
     };
     if !result.deduplicated {
         super::cleanup::notify_inserted(core);

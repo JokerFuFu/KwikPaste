@@ -167,7 +167,16 @@ pub async fn query_items_page(
     pool: &SqlitePool,
     q: &ClipboardItemQuery,
 ) -> Result<(Vec<ClipboardItem>, i64)> {
-    let keyword = KeywordFilter::from_keyword(q.keyword.as_deref());
+    query_items_page_with_ocr(pool, q, false).await
+}
+
+/// Uses one switch-aware predicate for rows and totals; paused OCR stays searchable.
+pub async fn query_items_page_with_ocr(
+    pool: &SqlitePool,
+    q: &ClipboardItemQuery,
+    ocr_enabled: bool,
+) -> Result<(Vec<ClipboardItem>, i64)> {
+    let keyword = KeywordFilter::from_keyword(q.keyword.as_deref()).with_ocr(ocr_enabled);
     let items = fetch_items(pool, q, keyword.clone()).await?;
     let total = fetch_items_count(pool, q, keyword).await?;
     Ok((items, total))
@@ -457,7 +466,16 @@ pub async fn list_item_refs(
     pool: &SqlitePool,
     q: &ClipboardItemQuery,
 ) -> Result<Vec<ClipboardItemRef>> {
-    let keyword = KeywordFilter::from_keyword(q.keyword.as_deref());
+    list_item_refs_with_ocr(pool, q, false).await
+}
+
+/// Selection IDs use the same OCR policy and filters as the displayed page.
+pub async fn list_item_refs_with_ocr(
+    pool: &SqlitePool,
+    q: &ClipboardItemQuery,
+    ocr_enabled: bool,
+) -> Result<Vec<ClipboardItemRef>> {
+    let keyword = KeywordFilter::from_keyword(q.keyword.as_deref()).with_ocr(ocr_enabled);
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT clipboard_items.id, clipboard_items.is_favorite, clipboard_items.is_pinned \
          FROM clipboard_items WHERE 1 = 1",
@@ -562,9 +580,19 @@ enum KeywordFilter {
     Fts(String),
     /// 已转义 `% _ \` 的关键词；下游统一拼成 `%<kw>%` 多列模糊匹配。
     Like(String),
+    FtsOcr(String),
+    LikeOcr(String),
 }
 
 impl KeywordFilter {
+    fn with_ocr(self, enabled: bool) -> Self {
+        match (enabled, self) {
+            (true, Self::Fts(expr)) => Self::FtsOcr(expr),
+            (true, Self::Like(keyword)) => Self::LikeOcr(keyword),
+            (_, filter) => filter,
+        }
+    }
+
     /// 按字符数（非字节）判定走 FTS 还是 LIKE。CJK 一个字符也算 1，
     /// 与 trigram 的 3 字符门槛保持一致。
     ///
@@ -695,22 +723,27 @@ fn push_filter_clauses(
 ) {
     match keyword {
         KeywordFilter::None => {}
-        KeywordFilter::Fts(expr) => {
-            qb.push(
-                " AND clipboard_items.rowid IN (SELECT rowid FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ",
-            )
-            .push_bind(expr.clone())
-            .push(")");
+        KeywordFilter::Fts(expr) | KeywordFilter::FtsOcr(expr) => {
+            qb.push(" AND (clipboard_items.rowid IN (SELECT rowid FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ")
+                .push_bind(expr.clone()).push(")");
+            if matches!(keyword, KeywordFilter::FtsOcr(_)) {
+                qb.push(" OR (clipboard_items.kind = 'image' AND EXISTS (SELECT 1 FROM image_ocr o WHERE o.item_id = clipboard_items.id AND o.status = 'completed' AND o.rowid IN (SELECT rowid FROM image_ocr_fts WHERE image_ocr_fts MATCH ")
+                    .push_bind(expr.clone()).push(")))");
+            }
+            qb.push(")");
         }
-        KeywordFilter::Like(kw) => {
-            // FTS 索引覆盖 search_text / note 两列，LIKE 兜底也跟齐，
-            // 让 1–2 字符短词的命中范围与长词一致。
+        KeywordFilter::Like(kw) | KeywordFilter::LikeOcr(kw) => {
             let pattern = format!("%{kw}%");
             qb.push(" AND (clipboard_items.search_text LIKE ")
                 .push_bind(pattern.clone())
                 .push(" ESCAPE '\\' OR clipboard_items.note LIKE ")
-                .push_bind(pattern)
-                .push(" ESCAPE '\\')");
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\'");
+            if matches!(keyword, KeywordFilter::LikeOcr(_)) {
+                qb.push(" OR (clipboard_items.kind = 'image' AND EXISTS (SELECT 1 FROM image_ocr o WHERE o.item_id = clipboard_items.id AND o.status = 'completed' AND o.text LIKE ")
+                    .push_bind(pattern).push(" ESCAPE '\\'))");
+            }
+            qb.push(")");
         }
     }
     // group（UI Tab）覆盖显式 kind / favorite；为 None 时回退到显式字段（单测使用）。
@@ -780,6 +813,120 @@ mod tests {
 
     fn ids(items: &[ClipboardItem]) -> Vec<&str> {
         items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn image_ocr_search_respects_all_filters_and_deduplicates_note_matches() {
+        let pool = memory_pool().await;
+        sqlx::query("INSERT INTO clipboard_groups(id,name,icon,sort_order,created_at,updated_at) VALUES('g','OCR group','',0,'2026-01-01','2026-01-01')").execute(&pool).await.unwrap();
+        for id in ["selected", "other", "pending", "failed", "text"] {
+            let mut item = sample_item(id);
+            if id == "text" {
+                item.search_text = Some("invoice".into());
+            } else {
+                item.kind = ClipboardKind::Image;
+            }
+            if id == "selected" {
+                item.group_id = Some("g".into());
+                item.is_favorite = true;
+                item.is_pinned = true;
+                item.note = Some("invoice".into());
+            }
+            insert_item(&pool, &item).await.unwrap();
+            if id != "text" {
+                crate::db::ocr::enqueue(&pool, id).await.unwrap();
+                sqlx::query("UPDATE image_ocr SET status=?, text='invoice' WHERE item_id=?")
+                    .bind(if id == "pending" {
+                        "pending"
+                    } else if id == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    })
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        let base = ClipboardItemQuery {
+            keyword: Some("invoice".into()),
+            limit: 1,
+            ..Default::default()
+        };
+        let cases = [
+            (base.clone(), 3),
+            (
+                ClipboardItemQuery {
+                    kind: Some(ClipboardKind::Image),
+                    ..base.clone()
+                },
+                2,
+            ),
+            (
+                ClipboardItemQuery {
+                    kind: Some(ClipboardKind::Text),
+                    ..base.clone()
+                },
+                1,
+            ),
+            (
+                ClipboardItemQuery {
+                    favorite: Some(true),
+                    ..base.clone()
+                },
+                1,
+            ),
+            (
+                ClipboardItemQuery {
+                    pinned: Some(true),
+                    ..base.clone()
+                },
+                1,
+            ),
+            (
+                ClipboardItemQuery {
+                    group_id: Some("g".into()),
+                    ..base.clone()
+                },
+                1,
+            ),
+            (
+                ClipboardItemQuery {
+                    group: Some(ClipboardGroupFilter::Favorite),
+                    ..base.clone()
+                },
+                1,
+            ),
+            (
+                ClipboardItemQuery {
+                    group: Some(ClipboardGroupFilter::Image),
+                    ..base.clone()
+                },
+                2,
+            ),
+        ];
+        for (query, expected) in cases {
+            let (rows, total) = query_items_page_with_ocr(&pool, &query, true)
+                .await
+                .unwrap();
+            assert_eq!(total, expected);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                list_item_refs_with_ocr(&pool, &query, true)
+                    .await
+                    .unwrap()
+                    .len() as i64,
+                total
+            );
+        }
+        assert_eq!(
+            query_items_page_with_ocr(&pool, &base, false)
+                .await
+                .unwrap()
+                .1,
+            2
+        );
     }
 
     #[tokio::test]

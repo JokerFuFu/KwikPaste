@@ -261,6 +261,11 @@ jobs:
           "GPUI_FXC_PATH=$fxc" >> $env:GITHUB_ENV
 
       # 正式身份只在这里打开。静态 CRT 只经 --target 的 rustflags 生效（build.rs 缺了会直接失败）。
+      - name: Prepare bundled offline Windows OCR
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-windows-ocr.ps1 -Architecture ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'arm64' || 'x64' }}
+
       - name: Build
         shell: bash
         env:

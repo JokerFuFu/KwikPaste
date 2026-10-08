@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in offline image OCR search using Apple Vision on macOS and bundled Tesseract English/Simplified Chinese models on Windows.
+- Manage pause/resume, historical backfill and retries, progress, and derived-index clearing from Preferences › Data. Original images, records, favorites, notes, and groups are preserved.
+- Adopt existing migrated OCR tables as well as clean databases; OCR matches respect the existing history filters.
+- Clear obsolete bulk selection after OCR matches disappear and reject stale select-all results.
+
 All notable changes to KwikPaste are documented here.
 
 ## 2.0.0 - 2026-10-08

@@ -219,6 +219,15 @@ pub struct Clipboard {
     pub preview: Preview,
     pub feedback: Feedback,
     pub filters: Filters,
+    pub ocr: ImageOcr,
+}
+
+/// Opt-in local image text recognition; pause retains completed searchable results.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ImageOcr {
+    pub enabled: bool,
+    pub paused: bool,
 }
 
 /// 剪贴板内容类型采集开关。关闭后监听与手动读取都不入库对应类型。

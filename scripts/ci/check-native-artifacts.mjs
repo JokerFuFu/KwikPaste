@@ -3,14 +3,14 @@
 //   names       KwikPaste_<v>_{x64,arm64}-setup.exe, _{x64,arm64}_portable.zip, _{aarch64,x64}.dmg,
 //               _{aarch64,x64}.app.tar.gz; .sig next to setup, zip and tar.gz (the dmg is not signed).
 //   .sig        base64 minisign over the raw asset bytes, made with the release key (or --pubkey).
-//   portable    exactly KwikPaste/KwikPaste.exe and KwikPaste/portable.txt: the 1.x portable updater
+//   portable    KwikPaste.exe, portable.txt and bundled OCR notices: the 1.x portable updater
 //               takes the only .exe; the marker is the one 1.x ships.
 //   .app.tar.gz the only top-level entry is KwikPaste.app/, no ./ prefix, no AppleDouble (._*), no
 //               absolute or .. paths, the executable is 0755; Info.plist has the 19 keys of 1.4.0 with the
 //               same identifier, executable and document types, and LSMinimumSystemVersion 10.15.
 //   e2e         no binary contains the e2e-overrides sentinel.
-//   size        the Windows installers stay within the budget in lib/size.mjs: warning above 5.5 MiB,
-//               error above 6 MiB.
+//   size        the Windows installers stay within the budget in lib/size.mjs: warning above 14 MiB,
+//               error above 16 MiB.
 //   latest.json must not exist: old clients read GitHub's latest/download/latest.json.
 //
 // Usage: node scripts/ci/check-native-artifacts.mjs <dir> --version <v> [--identity production|test]
@@ -137,10 +137,14 @@ export const checkPortableZip = (buf) => {
   const entries = zipEntries(buf);
   const names = entries.map((entry) => entry.name).sort();
   if (
-    !isDeepEqual(names, ["KwikPaste/KwikPaste.exe", "KwikPaste/portable.txt"])
+    !isDeepEqual(names, [
+      "KwikPaste/KwikPaste.exe",
+      "KwikPaste/OCR-NOTICES.txt",
+      "KwikPaste/portable.txt",
+    ])
   ) {
     problems.push(
-      `entries are ${JSON.stringify(names)}, expected KwikPaste/KwikPaste.exe and KwikPaste/portable.txt`,
+      `entries are ${JSON.stringify(names)}, expected KwikPaste/KwikPaste.exe, KwikPaste/OCR-NOTICES.txt and KwikPaste/portable.txt`,
     );
     return problems;
   }
@@ -165,6 +169,16 @@ export const checkPortableZip = (buf) => {
     )
   ) {
     problems.push("portable.txt differs from the marker 1.x ships");
+  }
+
+  const notices = zipRead(
+    buf,
+    entries.find((entry) => entry.name === "KwikPaste/OCR-NOTICES.txt"),
+  ).toString("utf8");
+  for (const component of ["tesseract.txt", "tessdata-fast.txt", "Apache License"]) {
+    if (!notices.includes(component)) {
+      problems.push(`OCR-NOTICES.txt is missing ${component}`);
+    }
   }
 
   return problems;

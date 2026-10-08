@@ -159,27 +159,29 @@ mod tests {
 
     #[test]
     fn second_launches_map_to_the_1x_actions() {
+        #[cfg(target_os = "windows")]
+        let (cwd, absolute_backup, work) = (r"C:\", r"D:\backup\history.KwikPasteBak", r"C:\work");
+        #[cfg(target_os = "macos")]
+        let (cwd, absolute_backup, work) = ("/", "/tmp/backup/history.KwikPasteBak", "/tmp/work");
+
         assert_eq!(
-            request_for_invocation(&args(&[]), r"C:\"),
+            request_for_invocation(&args(&[]), cwd),
             Some(HostRequest::OpenPreferences {
                 source: RequestSource::SecondLaunch
             })
         );
+        assert_eq!(request_for_invocation(&args(&["--auto-launch"]), cwd), None);
         assert_eq!(
-            request_for_invocation(&args(&["--auto-launch"]), r"C:\"),
-            None
-        );
-        assert_eq!(
-            request_for_invocation(&args(&[r"D:\backup\history.KwikPasteBak"]), r"C:\"),
+            request_for_invocation(&args(&[absolute_backup]), cwd),
             Some(HostRequest::ImportBackup {
-                path: PathBuf::from(r"D:\backup\history.KwikPasteBak"),
+                path: PathBuf::from(absolute_backup),
                 source: RequestSource::SecondLaunch
             })
         );
         // 备份文件优先于 --auto-launch。
         assert!(matches!(
-            request_for_invocation(&args(&["--auto-launch", "a.kwikpastebak"]), r"C:\work"),
-            Some(HostRequest::ImportBackup { path, .. }) if path == Path::new(r"C:\work\a.kwikpastebak")
+            request_for_invocation(&args(&["--auto-launch", "a.kwikpastebak"]), work),
+            Some(HostRequest::ImportBackup { path, .. }) if path == Path::new(work).join("a.kwikpastebak")
         ));
     }
 }

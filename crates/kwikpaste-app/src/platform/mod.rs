@@ -61,10 +61,11 @@ mod native;
 #[path = "native_windows.rs"]
 mod native;
 
+use std::{path::PathBuf, rc::Rc};
+
+#[cfg(target_os = "windows")]
 use std::{
     cell::{Cell, RefCell},
-    path::PathBuf,
-    rc::Rc,
     time::Duration,
 };
 

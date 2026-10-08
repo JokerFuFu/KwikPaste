@@ -79,6 +79,26 @@
     "shortcutInUse": "In use by another app",
     "shortcutNotSet": "Not set"
   },
+  "imageOcr": {
+    "clear": "Clear text index",
+    "clearContent": "This clears recognized text and pending recognition work, then pauses recognition. Original images, clipboard history, favorites, notes and groups are preserved. Historical images can be indexed again later.",
+    "clearTitle": "Clear the image text index?",
+    "cleared": "Text index cleared and recognition paused. Original images and history were preserved.",
+    "counts": "Images {{total}} · Pending {{pending}} · Completed {{completed}} · Failed {{failed}}",
+    "disabled": "Text search disabled",
+    "enable": "Enable offline image text search",
+    "error": "Image text recognition: {{message}}",
+    "idle": "Recognition queue idle",
+    "indexHistory": "Index historical images / retry failures",
+    "loading": "Loading recognition status…",
+    "pause": "Pause recognition",
+    "paused": "Recognition paused; completed results remain searchable",
+    "ready": "Offline engine ready",
+    "resume": "Resume recognition",
+    "running": "Processing images",
+    "statusUnavailable": "Recognition status unavailable",
+    "unavailable": "Offline engine unavailable"
+  },
   "lanSync": {
     "connect": {
       "addressPlaceholder": "e.g. [fe80::1%12]:41573",
@@ -411,6 +431,9 @@
       "globalShortcuts": {
         "title": "Global Shortcuts"
       },
+      "imageOcr": {
+        "title": "Image Text Recognition"
+      },
       "lanContent": {
         "title": "What to Sync"
       },
@@ -729,6 +752,12 @@
             "remind": "Remind only"
           },
           "title": "When Over Limit"
+        }
+      },
+      "ocr": {
+        "imageRecognition": {
+          "description": "Recognize Chinese and English text locally for search. Off by default. New images are processed automatically when enabled; index historical images manually.",
+          "title": "Image Text Search"
         }
       },
       "organizing": {

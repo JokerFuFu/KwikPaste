@@ -133,6 +133,8 @@ pub enum Control {
     StorageOverview,
     /// 局域网同步的设备、配对与连接控制面板。
     LanSync,
+    /// 图片文字索引的开关、队列状态与管理操作。
+    ImageOcr,
     ShortcutRecorder,
 }
 
@@ -142,7 +144,11 @@ impl Control {
     pub fn full_width(self) -> bool {
         matches!(
             self,
-            Self::CaptureKinds | Self::CaptureOrder | Self::RetentionRules | Self::LanSync
+            Self::CaptureKinds
+                | Self::CaptureOrder
+                | Self::RetentionRules
+                | Self::LanSync
+                | Self::ImageOcr
         )
     }
 }
@@ -622,6 +628,23 @@ fn appearance_sections() -> Vec<Section> {
 fn capture_sections() -> Vec<Section> {
     vec![
         Section {
+            id: "imageOcr",
+            settings: vec![
+                Setting::new("ocr.imageRecognition", Control::ImageOcr).keywords(&[
+                    "ocr",
+                    "image",
+                    "recognition",
+                    "search",
+                    "offline",
+                    "index",
+                    "图片",
+                    "文字",
+                    "识别",
+                    "搜索",
+                ]),
+            ],
+        },
+        Section {
             id: "capture",
             settings: vec![
                 Setting::new("capture.kinds", Control::CaptureKinds)
@@ -1042,6 +1065,71 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn image_ocr_controls_remain_visible_when_disabled() {
+        let settings = Settings::default();
+        let tabs = tabs(false);
+        let capture = tabs
+            .iter()
+            .find(|tab| tab.id == TabId::Capture)
+            .expect("capture tab");
+        let panel = capture
+            .sections
+            .iter()
+            .flat_map(|section| &section.settings)
+            .find(|setting| setting.id == "ocr.imageRecognition")
+            .expect("image OCR panel");
+        assert!(panel.control.full_width());
+        assert!(!panel.is_collapsed(&settings));
+        assert!(!settings.clipboard.ocr.enabled);
+    }
+
+    #[test]
+    fn image_ocr_locales_cover_controls_counts_and_preservation_confirmation() {
+        for source in [
+            include_str!("../../locales/zh-CN/preferences.json"),
+            include_str!("../../locales/en-US/preferences.json"),
+        ] {
+            let locale: Value = serde_json::from_str(source).expect("preference locale JSON");
+            for key in [
+                "enable",
+                "pause",
+                "resume",
+                "indexHistory",
+                "clear",
+                "counts",
+                "ready",
+                "unavailable",
+                "statusUnavailable",
+                "loading",
+                "disabled",
+                "paused",
+                "running",
+                "idle",
+                "clearTitle",
+                "clearContent",
+                "cleared",
+                "error",
+            ] {
+                assert!(
+                    locale["imageOcr"][key]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()),
+                    "missing imageOcr.{key}"
+                );
+            }
+            for count in ["total", "pending", "completed", "failed"] {
+                assert!(
+                    locale["imageOcr"]["counts"]
+                        .as_str()
+                        .expect("counts")
+                        .contains(&format!("{{{{{count}}}}}"))
+                );
+            }
+            assert!(locale["schema"]["settings"]["ocr"]["imageRecognition"]["title"].is_string());
         }
     }
 }
