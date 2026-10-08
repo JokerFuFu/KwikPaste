@@ -8,7 +8,9 @@ $RepoRoot = Split-Path $PSScriptRoot -Parent
 $VcpkgRevision = '9e3427bc82738568947beb508e78231f99c04f4c'
 $ModelRevision = '87416418657359cb625c412a48b6e1d6d41c29bd'
 $Triplet = "$Architecture-windows-static"
-$CacheRoot = Join-Path $RepoRoot 'target/windows-ocr'
+# rust-cache cleans files below Cargo target, including nested .git/HEAD and native libraries.
+$CacheBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$CacheRoot = Join-Path $CacheBase 'kwikpaste-windows-ocr'
 $VcpkgRoot = Join-Path $CacheRoot "vcpkg-$VcpkgRevision"
 $ModelRoot = Join-Path $RepoRoot 'crates/kwikpaste-core/assets/ocr/tessdata'
 $LicenseRoot = Join-Path $RepoRoot 'crates/kwikpaste-core/assets/ocr/licenses'
