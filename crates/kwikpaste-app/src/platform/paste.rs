@@ -14,7 +14,7 @@ use kwikpaste_core::{AppError, Core, Result};
 use kwikpaste_os::{keystroke, paste_target::PasteTarget};
 
 use super::panel::{PanelCommand, Trigger, TriggerSource};
-use super::paste_coordinator::{PasteCoordinator, PasteLease, PasteToken};
+use super::paste_coordinator::{PasteCoordinator, PasteLease, PasteToken, shared_coordinator};
 use super::probe;
 use crate::core_host;
 
@@ -22,8 +22,13 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(1);
 const READINESS_POLL: Duration = Duration::from_millis(15);
 const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Default)]
 struct PasteState(Arc<PasteCoordinator>);
+
+impl Default for PasteState {
+    fn default() -> Self {
+        Self(shared_coordinator())
+    }
+}
 
 impl Global for PasteState {}
 
@@ -518,7 +523,7 @@ mod tests {
     fn inside_click_observed_before_capture_processing_prevents_creating_a_ticket() {
         let state = Arc::new(PasteCoordinator::default());
         let lease = state.try_begin(100).unwrap();
-        let inside = PanelCommand::SetInputCapture(true).observed_at(150);
+        let inside = PanelCommand::SetInputCapture(true).observed_with(150, &state);
         let PanelCommand::Observed { ticks, .. } = inside else {
             panic!("missing inside stamp");
         };

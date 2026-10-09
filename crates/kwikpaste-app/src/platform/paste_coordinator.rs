@@ -1,13 +1,17 @@
-//! 协调本进程的粘贴写回与注入，防止重叠操作或显式复制使旧任务粘贴错误内容。
+//! 协调本进程的粘贴写回与注入；状态切换由同一短锁保护，后台生产者可同步取消旧任务。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+#[derive(Debug, Default)]
+struct State {
+    busy: bool,
+    generation: u64,
+    started_ticks: i64,
+}
 
 #[derive(Debug, Default)]
 pub(super) struct PasteCoordinator {
-    busy: AtomicBool,
-    generation: AtomicU64,
-    started_ticks: AtomicI64,
+    state: Mutex<State>,
 }
 
 pub(super) struct PasteLease {
@@ -21,45 +25,68 @@ pub struct PasteToken {
     generation: u64,
 }
 
-impl PasteCoordinator {
-    /// 在写回剪贴板前取得单次租约。
-    pub(super) fn try_begin(self: &Arc<Self>, ticks: i64) -> Option<PasteLease> {
-        self.busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()?;
-        let generation = self
-            .generation
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
-        self.started_ticks.store(ticks, Ordering::SeqCst);
-        Some(PasteLease {
-            state: self.clone(),
-            generation,
-        })
-    }
+/// Both pre-GPUI bridges and the GPUI Global use the same process-local coordinator.
+pub(super) fn shared_coordinator() -> Arc<PasteCoordinator> {
+    static SHARED: OnceLock<Arc<PasteCoordinator>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| Arc::new(PasteCoordinator::default()))
+        .clone()
+}
 
-    /// 复制动作发生后，旧粘贴任务不能继续注入。
-    pub(super) fn cancel(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-    }
+/// Runtime controls cancel at observation time, before their native operation enters the UI queue.
+pub(super) fn observe_control(ticks: i64) {
+    shared_coordinator().cancel_before(ticks);
 }
 
 impl PasteCoordinator {
-    /// Queued controls observed before a newer operation cannot cancel or modify it.
+    /// Recover poisoned state without panicking; callers never retain this guard across OS or GPUI work.
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Acquire and publish all lease metadata in one transition before clipboard preparation starts.
+    pub(super) fn try_begin(self: &Arc<Self>, ticks: i64) -> Option<PasteLease> {
+        let mut state = self.lock();
+        if state.busy {
+            return None;
+        }
+        state.busy = true;
+        state.generation = state.generation.wrapping_add(1);
+        state.started_ticks = ticks;
+        Some(PasteLease {
+            state: self.clone(),
+            generation: state.generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancel(&self) {
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
+    }
+
+    /// A control observed before a newer lease cannot cancel or modify that lease.
     pub(super) fn started_after(&self, ticks: i64) -> bool {
-        self.busy.load(Ordering::SeqCst) && self.started_ticks.load(Ordering::SeqCst) > ticks
+        let state = self.lock();
+        state.busy && state.started_ticks > ticks
     }
 
     pub(super) fn cancel_before(&self, ticks: i64) {
-        if !self.started_after(ticks) {
-            self.cancel();
+        let mut state = self.lock();
+        if !state.busy || state.started_ticks <= ticks {
+            state.generation = state.generation.wrapping_add(1);
         }
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        let state = self.lock();
+        state.busy && state.generation == generation
     }
 }
 
 impl PasteLease {
     pub(super) fn is_current(&self) -> bool {
-        self.state.generation.load(Ordering::SeqCst) == self.generation
+        self.state.is_current(self.generation)
     }
 
     pub(super) fn token(&self) -> PasteToken {
@@ -72,20 +99,58 @@ impl PasteLease {
 
 impl PasteToken {
     pub(super) fn is_current(&self) -> bool {
-        self.state.busy.load(Ordering::SeqCst)
-            && self.state.generation.load(Ordering::SeqCst) == self.generation
+        self.state.is_current(self.generation)
     }
 }
 
 impl Drop for PasteLease {
     fn drop(&mut self) {
-        self.state.busy.store(false, Ordering::SeqCst);
+        self.state.lock().busy = false;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_old_producer_cancellation_cannot_observe_half_published_lease_metadata() {
+        let coordinator = Arc::new(PasteCoordinator::default());
+        let producer_state = coordinator.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                producer_state.cancel_before(150);
+            }
+        });
+        for _ in 0..1_000 {
+            let lease = coordinator.try_begin(200).unwrap();
+            assert!(lease.is_current());
+            assert!(lease.token().is_current());
+            drop(lease);
+        }
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn poisoned_coordinator_recovers_without_panicking_or_releasing_an_active_lease() {
+        let coordinator = Arc::new(PasteCoordinator::default());
+        let lease = coordinator.try_begin(100).unwrap();
+        let poisoned = coordinator.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("intentional test poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(lease.is_current());
+        coordinator.cancel_before(150);
+        assert!(!lease.is_current());
+        assert!(coordinator.try_begin(200).is_none());
+        drop(lease);
+        assert!(coordinator.try_begin(200).is_some());
+    }
 
     #[test]
     fn queued_old_recapture_and_copy_hide_do_not_cancel_a_new_paste() {

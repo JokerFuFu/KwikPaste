@@ -80,10 +80,9 @@ pub fn create(cx: &mut App, commands: Sender<PanelCommand>) -> anyhow::Result<()
                     MENU_EXIT => TrayAction::Exit,
                     _ => continue,
                 };
-                if actions
-                    .send_blocking((action, kwikpaste_os::clock::now_ticks()))
-                    .is_err()
-                {
+                let ticks = kwikpaste_os::clock::now_ticks();
+                super::paste_coordinator::observe_control(ticks);
+                if actions.send_blocking((action, ticks)).is_err() {
                     break;
                 }
             }
@@ -194,8 +193,10 @@ fn bridge_left_click(actions: Sender<(TrayAction, i64)>) -> std::io::Result<()> 
                 else {
                     continue;
                 };
+                let ticks = kwikpaste_os::clock::now_ticks();
+                super::paste_coordinator::observe_control(ticks);
                 if actions
-                    .send_blocking((TrayAction::LeftClick, kwikpaste_os::clock::now_ticks()))
+                    .send_blocking((TrayAction::LeftClick, ticks))
                     .is_err()
                 {
                     break;

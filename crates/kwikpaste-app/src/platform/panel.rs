@@ -23,7 +23,7 @@ use super::editing::EditTrigger;
 use super::material::WindowMaterial;
 use super::native::NativePanel;
 use super::paste::{self, InjectReport, PasteCapture, PasteHandoff};
-use super::paste_coordinator::PasteToken;
+use super::paste_coordinator::{PasteCoordinator, PasteToken, shared_coordinator};
 use super::{probe, window_state};
 
 /// 面板的默认、最小内容区尺寸（逻辑像素），与 1.x 相同；Windows 上再乘系统「文本大小」。
@@ -171,10 +171,20 @@ impl PanelCommand {
         self.observed_at(clock::now_ticks())
     }
 
+    /// 保留事件生产时刻，入队前先取消同一进程中的旧粘贴。
     pub(super) fn observed_at(self, ticks: i64) -> Self {
         if matches!(self, Self::Observed { .. }) || !self.cancels_paste() {
             return self;
         }
+        self.observed_with(ticks, &shared_coordinator())
+    }
+
+    /// 同步失效旧租约再包装原生命令；测试可传入独立协调器。
+    pub(super) fn observed_with(self, ticks: i64, coordinator: &PasteCoordinator) -> Self {
+        if matches!(self, Self::Observed { .. }) || !self.cancels_paste() {
+            return self;
+        }
+        coordinator.cancel_before(ticks);
         Self::Observed {
             ticks,
             command: Box::new(self),
@@ -788,6 +798,51 @@ mod paste_control_tests {
     use super::*;
 
     #[test]
+    fn producer_inside_click_invalidates_an_inject_already_at_the_queue_head() {
+        use std::cell::Cell;
+        use std::sync::Arc;
+        let coordinator = Arc::new(PasteCoordinator::default());
+        let lease = coordinator.try_begin(100).unwrap();
+        let (commands, receiver) = async_channel::bounded(2);
+        let (done, _reply) = async_channel::bounded(1);
+        let target = PasteTarget {
+            generation: 1,
+            window: 100,
+            process_id: 20,
+        };
+        commands
+            .try_send(PanelCommand::InjectPaste {
+                handoff: PasteHandoff {
+                    target,
+                    panel_was_visible: true,
+                },
+                token: lease.token(),
+                deadline: Instant::now() + std::time::Duration::from_secs(1),
+                done,
+            })
+            .unwrap();
+        // The producer observes a nonactivating inside click, but its control remains behind Inject.
+        commands
+            .try_send(PanelCommand::SetInputCapture(true).observed_with(150, &coordinator))
+            .unwrap();
+        let PanelCommand::InjectPaste { token, .. } = receiver.try_recv().unwrap() else {
+            panic!("Inject must still be first");
+        };
+        let injected = Cell::new(false);
+        let result = paste::inject_if_current(
+            &token,
+            || Ok(true),
+            || {
+                injected.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!injected.get());
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
     fn late_preferences_and_tray_bridge_events_keep_their_original_cancellation_cutoff() {
         use super::super::paste_coordinator::PasteCoordinator;
         use std::sync::Arc;
@@ -799,10 +854,10 @@ mod paste_control_tests {
             ticks: 150,
         };
         sender
-            .try_send(PanelCommand::Show(trigger).observed_at(150))
+            .try_send(PanelCommand::Show(trigger).observed_with(150, &state))
             .unwrap();
         sender
-            .try_send(PanelCommand::CancelPaste.observed_at(175))
+            .try_send(PanelCommand::CancelPaste.observed_with(175, &state))
             .unwrap();
         for original_ticks in [150, 175] {
             let PanelCommand::Observed { ticks, .. } = receiver.try_recv().unwrap() else {
@@ -829,9 +884,10 @@ mod paste_control_tests {
             PanelCommand::DismissPopup,
             PanelCommand::CancelPaste,
         ];
+        let coordinator = PasteCoordinator::default();
         for control in controls {
             assert!(control.cancels_paste());
-            let observed = control.observed();
+            let observed = control.observed_with(clock::now_ticks(), &coordinator);
             let PanelCommand::Observed { ticks, .. } = &observed else {
                 panic!("user control must be observed by its producer");
             };

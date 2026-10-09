@@ -114,9 +114,11 @@ pub fn register(cx: &mut App, commands: Sender<PanelCommand>) -> anyhow::Result<
                             .send_blocking((offset, kwikpaste_os::clock::now_ticks()))
                             .is_ok()
                     }
-                    Some(Action::OpenPreference) => preference_sender
-                        .send_blocking(kwikpaste_os::clock::now_ticks())
-                        .is_ok(),
+                    Some(Action::OpenPreference) => {
+                        let ticks = kwikpaste_os::clock::now_ticks();
+                        super::paste_coordinator::observe_control(ticks);
+                        preference_sender.send_blocking(ticks).is_ok()
+                    }
                     Some(Action::PastePlain) => {
                         if let Err(err) = kwikpaste_os::keystroke::mask_modifier_release() {
                             log::warn!("modifier release could not be masked: {err}");
