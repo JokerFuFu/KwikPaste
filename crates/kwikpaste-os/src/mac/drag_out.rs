@@ -268,8 +268,7 @@ pub fn selftest_escape() -> io::Result<()> {
 /// 走正常的清理路径。
 ///
 /// # Safety
-///
-/// `native` 必须指向仍然存活、属于当前进程的 `NSView`，并在 AppKit 主线程调用。
+/// `native` 必须是主线程上仍然存活的 NSView 指针。
 pub unsafe fn selftest_drag(native: isize) -> io::Result<()> {
     let view = unsafe { &*(native as *const NSView) };
     let bounds = view.bounds();

@@ -25,9 +25,6 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Install the pinned Tauri CLI
         run: pnpm install --frozen-lockfile
-      - name: Prepare bundled offline Windows OCR
-        shell: pwsh
-        run: ./scripts/prepare-windows-ocr.ps1 -Architecture x64
       - name: Build the production-identity native app
         shell: pwsh
         env:

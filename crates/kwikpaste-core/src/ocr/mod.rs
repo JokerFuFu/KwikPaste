@@ -1,445 +1,573 @@
-//! Disposable local image text and a serial background queue, separate from clipboard history.
+//! 事件驱动的 OCR 调度：闲置时不保留线程、连接、管道、图片或文本缓冲。
+mod client;
+mod db;
+pub mod protocol;
+#[cfg(test)]
+mod tests;
 
-pub mod native;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, SqliteConnection};
 
-use serde::Serialize;
-use tokio::task::JoinHandle;
+use crate::{root::CoreInner, Core, CoreEvent, Result};
+use protocol::{Outcome, Request, Response};
 
-use crate::db::ocr as repository;
-use crate::error::Result;
-use crate::events::CoreEvent;
-use crate::root::{Core, CoreInner};
-use crate::settings::SettingsDelta;
+static HELPER_EXE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Serializes queue publication with policy edits, clear and data replacement.
-#[derive(Default)]
-pub(crate) struct OcrRuntime {
-    pub(crate) gate: tokio::sync::Mutex<()>,
-    generation: AtomicU64,
-    stopped: AtomicBool,
-    worker: Mutex<Option<JoinHandle<()>>>,
+/// 宿主必须指向自己的程序；core 绝不回退为进程内识别。
+pub fn set_helper_exe(path: PathBuf) {
+    let _ = HELPER_EXE.set(path);
 }
 
-impl OcrRuntime {
-    pub(crate) fn invalidate(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImageOcrStatus {
-    pub supported: bool,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OcrStatus {
     pub enabled: bool,
-    pub paused: bool,
-    pub total: i64,
-    pub pending: i64,
-    pub completed: i64,
-    pub failed: i64,
+    pub total_images: u64,
+    pub recognized: u64,
+    pub with_text: u64,
+    pub failed: u64,
+    pub pending: u64,
+    pub running: bool,
+}
+
+/// 识别文字里命中关键词的一小段：`matched` 是关键词在 `text` 里的字节范围（可能为空）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSnippet {
+    pub text: String,
+    pub matched: std::ops::Range<usize>,
+}
+
+/// 片段最多的字符数，以及命中处前面保留的字符数。
+const SNIPPET_CHARS: usize = 48;
+const SNIPPET_LEAD: usize = 10;
+
+/// 在识别文字里找关键词（先整串、再逐个词，不分大小写），截一段带省略号的单行片段。
+/// 换行和连续空白压成一个空格；都找不到时从开头截。
+pub(crate) fn snippet(text: &str, keyword: &str) -> Option<TextSnippet> {
+    let flat: Vec<char> = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .collect();
+    if flat.is_empty() {
+        return None;
+    }
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let lower: Vec<char> = flat.iter().copied().map(fold).collect();
+    let keyword = keyword.trim();
+    let found = std::iter::once(keyword)
+        .chain(keyword.split_whitespace())
+        .map(|needle| needle.chars().map(fold).collect::<Vec<_>>())
+        .filter(|needle| !needle.is_empty() && needle.len() <= lower.len())
+        .find_map(|needle| {
+            lower
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+                .map(|at| (at, needle.len()))
+        });
+    let (at, len) = found.unwrap_or((0, 0));
+    let mut start = at.saturating_sub(SNIPPET_LEAD);
+    let end = (start + SNIPPET_CHARS).max(at + len).min(flat.len());
+    start = start.min(end.saturating_sub(SNIPPET_CHARS));
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    let mut matched = 0..0;
+    for (index, ch) in flat.iter().enumerate().take(end).skip(start) {
+        if index == at && len > 0 {
+            matched.start = out.len();
+        }
+        out.push(*ch);
+        if index + 1 == at + len && len > 0 {
+            matched.end = out.len();
+        }
+    }
+    if end < flat.len() {
+        out.push('…');
+    }
+    Some(TextSnippet { text: out, matched })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OcrSupport {
+    Available { languages: Vec<String> },
+    MissingLanguage,
+    Unsupported,
+}
+
+#[derive(Default)]
+struct State {
+    generation: u64,
+    running: bool,
+    dirty: bool,
+    suspended: usize,
+    stopped: bool,
+    child: Option<client::ChildHandle>,
+}
+
+#[derive(Default)]
+pub(crate) struct Scheduler {
+    core: OnceLock<Weak<CoreInner>>,
+    state: Mutex<State>,
+    finished: tokio::sync::Notify,
+    support: OnceLock<OcrSupport>,
+    probe_lock: tokio::sync::Mutex<()>,
+    startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(target_os = "windows")]
+    helper_peak: std::sync::atomic::AtomicU64,
+}
+
+impl Scheduler {
+    pub(crate) fn bind(&self, core: Weak<CoreInner>) {
+        let _ = self.core.set(core);
+    }
+
+    fn core(&self) -> Option<Arc<CoreInner>> {
+        self.core.get()?.upgrade()
+    }
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    fn valid(&self, generation: u64) -> bool {
+        let state = self.state();
+        state.generation == generation && state.suspended == 0 && !state.stopped
+    }
+
+    /// 仅已启用且确有派生队列时设置一次启动延迟；关闭会取消这个延迟。
+    pub(crate) async fn startup(&self) {
+        let Some(core) = self.core() else {
+            return;
+        };
+        if !core.settings.snapshot().clipboard.ocr.enabled || HELPER_EXE.get().is_none() {
+            return;
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT EXISTS(");
+        query.push(db::NEXT_JOB).push(")");
+        let pending = query
+            .build_query_scalar::<bool>()
+            .fetch_one(&core.db.pool().await)
+            .await;
+        if !matches!(pending, Ok(true)) {
+            return;
+        }
+        let weak = Arc::downgrade(&core);
+        let task = core.rt.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if let Some(core) = weak.upgrade() {
+                core.ocr
+                    .startup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
+                core.ocr.nudge();
+            }
+        });
+        *self.startup.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
+    }
+
+    /// 只在启用后响应事件；锁内合并唤醒，避免收尾与新插入之间丢工作。
+    pub(crate) fn nudge(&self) {
+        let Some(core) = self.core() else {
+            return;
+        };
+        if !core.settings.snapshot().clipboard.ocr.enabled || HELPER_EXE.get().is_none() {
+            return;
+        }
+        let mut state = self.state();
+        if state.stopped {
+            return;
+        }
+        state.dirty = true;
+        if state.running || state.suspended != 0 {
+            return;
+        }
+        state.running = true;
+        state.dirty = false;
+        let generation = state.generation;
+        core.events.emit(CoreEvent::OcrChanged);
+        let worker = core.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("ocr-session".into())
+            .spawn(move || {
+                if let Err(err) = session(&worker, generation) {
+                    log::warn!("OCR session stopped: {err}");
+                }
+                // session 已关闭专用 SQLite 连接、helper 与读取线程后才发布 idle。
+                let mut state = worker.ocr.state();
+                state.running = false;
+                state.child = None;
+                let again = state.dirty;
+                drop(state);
+                worker.events.emit(CoreEvent::OcrChanged);
+                worker.ocr.finished.notify_waiters();
+                if again {
+                    worker.ocr.nudge();
+                }
+            })
+        {
+            state.running = false;
+            log::warn!("OCR session thread unavailable: {err}");
+            core.events.emit(CoreEvent::OcrChanged);
+        }
+    }
+
+    /// 设置变化立即废弃在途结果；关闭后不会重新启动。
+    pub(crate) fn settings_changed(&self) {
+        self.invalidate();
+        if let Some(core) = self.core() {
+            core.events.emit(CoreEvent::OcrChanged);
+        }
+        self.nudge();
+    }
+
+    fn invalidate(&self) {
+        if let Some(task) = self
+            .startup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        let child = {
+            let mut state = self.state();
+            state.generation = state.generation.wrapping_add(1);
+            state.child.clone()
+        };
+        if let Some(child) = child {
+            client::kill(&child);
+        }
+    }
+
+    /// 换库/删行前暂停并等待专用连接真正关闭，RAII 在成功和失败路径都恢复调度。
+    pub(crate) async fn suspend(&self) -> Suspension {
+        if !self.state().running
+            && !self
+                .core()
+                .is_some_and(|core| core.settings.snapshot().clipboard.ocr.enabled)
+        {
+            return Suspension(Weak::new());
+        }
+        self.state().suspended += 1;
+        self.invalidate();
+        loop {
+            let done = self.finished.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            if !self.state().running {
+                break;
+            }
+            done.await;
+        }
+        Suspension(self.core.get().cloned().unwrap_or_default())
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.state().stopped = true;
+        let _guard = self.suspend().await;
+    }
+}
+
+pub(crate) struct Suspension(Weak<CoreInner>);
+impl Drop for Suspension {
+    fn drop(&mut self) {
+        if let Some(core) = self.0.upgrade() {
+            let mut state = core.ocr.state();
+            state.suspended = state.suspended.saturating_sub(1);
+            state.dirty = true;
+            drop(state);
+            core.events.emit(CoreEvent::OcrChanged);
+            core.ocr.nudge();
+        }
+    }
+}
+
+/// 开启受限页缓存的独立连接；显式 close 会终止 sqlx 的连接工作线程。
+async fn connect(core: &CoreInner) -> anyhow::Result<SqliteConnection> {
+    let options = SqliteConnectOptions::new()
+        .filename(crate::db::db_path(&core.paths)?)
+        .foreign_keys(true)
+        .pragma("cache_size", "-256")
+        .pragma("mmap_size", "0")
+        .statement_cache_capacity(0)
+        .disable_statement_logging();
+    Ok(SqliteConnection::connect_with(&options).await?)
+}
+
+fn session(core: &CoreInner, generation: u64) -> anyhow::Result<()> {
+    let mut connection = core.rt.block_on(connect(core))?;
+    let result = run_jobs(core, generation, &mut connection);
+    let closed = core.rt.block_on(connection.close());
+    result?;
+    closed?;
+    Ok(())
+}
+
+/// 一次仅持有一条轻量队列记录；进度事件不超过每秒两次。
+fn run_jobs(
+    core: &CoreInner,
+    generation: u64,
+    connection: &mut SqliteConnection,
+) -> anyhow::Result<()> {
+    let mut helper: Option<client::Client> = None;
+    let mut failures = 0u32;
+    let mut last_event = Instant::now();
+    loop {
+        if !core.ocr.valid(generation) || !core.settings.snapshot().clipboard.ocr.enabled {
+            break;
+        }
+        let job: Option<(String, String, String)> = core
+            .rt
+            .block_on(sqlx::query_as(db::NEXT_JOB).fetch_optional(&mut *connection))?;
+        let Some((id, name, hash)) = job else {
+            let mut state = core.ocr.state();
+            if state.dirty && state.generation == generation {
+                state.dirty = false;
+                continue;
+            }
+            break;
+        };
+        if let Err(err) = crate::clipboard::validate_image_file_name(&name) {
+            core.rt.block_on(write_if_current(
+                core,
+                generation,
+                connection,
+                &id,
+                &hash,
+                &Outcome::Skipped {
+                    reason: err.to_string(),
+                },
+            ))?;
+            continue;
+        }
+        if helper.is_none() && failures != 0 {
+            let until = Instant::now() + Duration::from_secs((1u64 << failures.min(5)).min(30));
+            while Instant::now() < until && core.ocr.valid(generation) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !core.ocr.valid(generation) {
+                break;
+            }
+        }
+        if helper.is_none() {
+            let Some(exe) = HELPER_EXE.get() else {
+                break;
+            };
+            match client::Client::start(exe) {
+                Ok(client) => {
+                    let mut state = core.ocr.state();
+                    if state.generation != generation || state.suspended != 0 || state.stopped {
+                        drop(client);
+                        break;
+                    }
+                    state.child = Some(client.child.clone());
+                    helper = Some(client);
+                }
+                Err(err) => {
+                    log::warn!("OCR helper start failed: {err}");
+                }
+            }
+        }
+        let request = Request::Recognize {
+            job_id: id.clone(),
+            path: core
+                .images
+                .origin_path(&name)
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let response = helper.as_mut().map(|helper| helper.request(&request));
+        #[cfg(target_os = "windows")]
+        if let Some(helper) = &helper {
+            core.ocr.helper_peak.fetch_max(
+                client::peak_private_usage(&helper.child),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let outcome = match response {
+            Some(Ok(Response::Recognize { job_id, outcome })) if job_id == id => {
+                failures = 0;
+                match outcome {
+                    Outcome::Done { text, language } => Outcome::Done {
+                        text: text.chars().take(protocol::MAX_TEXT_CHARS).collect(),
+                        language,
+                    },
+                    other => other,
+                }
+            }
+            other => {
+                if let Some(client) = helper.take() {
+                    client::kill(&client.child);
+                    drop(client);
+                }
+                core.ocr.state().child = None;
+                failures = failures.saturating_add(1);
+                Outcome::Failed {
+                    reason: format!("helper failed: {other:?}"),
+                }
+            }
+        };
+        core.rt.block_on(write_if_current(
+            core, generation, connection, &id, &hash, &outcome,
+        ))?;
+        if last_event.elapsed() >= Duration::from_millis(500) {
+            core.events.emit(CoreEvent::OcrChanged);
+            last_event = Instant::now();
+        }
+    }
+    drop(helper);
+    core.ocr.state().child = None;
+    Ok(())
+}
+
+/// 与换库/清空共用 generation 栅栏和入库串行锁，旧结果不能写入新对象。
+async fn write_if_current(
+    core: &CoreInner,
+    generation: u64,
+    connection: &mut SqliteConnection,
+    id: &str,
+    hash: &str,
+    outcome: &Outcome,
+) -> anyhow::Result<bool> {
+    let _serial = core.upsert_lock.lock().await;
+    if !core.ocr.valid(generation) || !core.settings.snapshot().clipboard.ocr.enabled {
+        return Ok(false);
+    }
+    db::save(connection, id, hash, outcome).await?;
+    Ok(true)
 }
 
 impl Core {
-    pub async fn image_ocr_status(&self) -> Result<ImageOcrStatus> {
-        let core = self.clone();
-        self.hop(async move { status(&core.0).await }).await
+    /// Windows 测量入口：所有已完成请求所在 helper 的私有提交峰值。
+    #[cfg(target_os = "windows")]
+    pub fn ocr_helper_peak_private_usage(&self) -> u64 {
+        self.0
+            .ocr
+            .helper_peak
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Enqueue missing images and explicitly retry failures, retaining completed attempts.
-    pub async fn queue_image_ocr_history(&self) -> Result<ImageOcrStatus> {
+    /// 单次聚合返回历史图像、成功、终态失败和派生队列计数。
+    pub async fn ocr_status(&self) -> Result<OcrStatus> {
         let core = self.clone();
         self.hop(async move {
-            let _gate = core.0.ocr.gate.lock().await;
-            if core.0.ocr.stopped.load(Ordering::SeqCst)
-                || !native::supported()
-                || !core.settings().clipboard.ocr.enabled
-            {
-                return Err(anyhow::anyhow!("Image OCR is not enabled or supported").into());
+            let row: (i64, i64, i64, i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(t.status = 'done'),0), COALESCE(SUM(t.status = 'done' AND t.text <> ''),0), COALESCE(SUM(t.status = 'skipped' OR (t.status = 'failed' AND t.attempts >= 3)),0), COALESCE(SUM(t.item_id IS NULL OR (t.status = 'failed' AND t.attempts < 3)),0) FROM clipboard_items i LEFT JOIN image_texts t ON t.item_id = i.id WHERE i.kind = 'image'")
+                .fetch_one(&core.0.db.pool().await).await.map_err(anyhow::Error::from)?;
+            Ok(OcrStatus { enabled: core.settings().clipboard.ocr.enabled, total_images: row.0 as u64, recognized: row.1 as u64, with_text: row.2 as u64, failed: row.3 as u64, pending: row.4 as u64, running: core.0.ocr.state().running })
+        }).await
+    }
+
+    /// 显式探测走一次性 helper，缓存实际选中的语言，不在主进程加载 OCR 框架。
+    pub async fn ocr_support(&self) -> Result<OcrSupport> {
+        let core = self.clone();
+        self.hop(async move {
+            let _serial = core.0.ocr.probe_lock.lock().await;
+            if let Some(support) = core.0.ocr.support.get() {
+                return Ok(support.clone());
             }
-            repository::enqueue_history(&core.0.db.pool().await).await?;
-            core.0.events.emit(CoreEvent::ImageOcrChanged);
-            status(&core.0).await
+            let exe = HELPER_EXE
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("OCR helper executable not configured"))?
+                .clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("ocr-probe".into())
+                .spawn(move || {
+                    let result = (|| {
+                        let mut helper = client::Client::start(&exe)?;
+                        match helper.request(&Request::Probe)? {
+                            Response::Probe { support } => Ok(support),
+                            _ => Err(std::io::Error::other("unexpected OCR probe response")),
+                        }
+                    })();
+                    let _ = sender.send(result);
+                })
+                .map_err(anyhow::Error::from)?;
+            let support = receiver
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?
+                .map_err(anyhow::Error::from)?;
+            let _ = core.0.ocr.support.set(support.clone());
+            Ok(support)
         })
         .await
     }
 
-    /// Pause and invalidate in-flight recognition before deleting only the derived index.
-    pub async fn clear_image_ocr(&self) -> Result<ImageOcrStatus> {
+    /// 清空派生数据，并使旧 generation 的结果不可落库。
+    pub async fn clear_ocr_data(&self) -> Result<()> {
         let core = self.clone();
         self.hop(async move {
-            let _gate = core.0.ocr.gate.lock().await;
-            core.0.ocr.invalidate();
-            let patch = serde_json::json!({"clipboard":{"ocr":{"paused":true}}});
-            let delta = SettingsDelta::from_patch(&patch);
-            let next = core.0.settings.update(patch)?;
-            core.0.events.emit(CoreEvent::SettingsUpdated {
-                settings: Arc::new(next),
-                delta,
-            });
-            repository::clear(&core.0.db.pool().await).await?;
-            core.0.events.emit(CoreEvent::ImageOcrChanged);
-            status(&core.0).await
+            let _pause = core.0.ocr.suspend().await;
+            let mut connection = connect(&core.0).await.map_err(crate::AppError::from)?;
+            let result = sqlx::query("DELETE FROM image_texts")
+                .execute(&mut connection)
+                .await;
+            connection.close().await.map_err(anyhow::Error::from)?;
+            result.map_err(anyhow::Error::from)?;
+            core.0.events.emit(CoreEvent::OcrChanged);
+            Ok(())
         })
         .await
     }
 
-    /// Configure local engine resources before starting clipboard capture.
-    pub fn configure_image_ocr_models(&self, model_dir: &Path) -> Result<()> {
-        native::configure(model_dir)?;
-        self.0.events.emit(CoreEvent::ImageOcrChanged);
-        Ok(())
-    }
-}
-
-async fn status(core: &CoreInner) -> Result<ImageOcrStatus> {
-    let policy = core.settings.snapshot().clipboard.ocr;
-    let counts = repository::counts(&core.db.pool().await).await?;
-    Ok(ImageOcrStatus {
-        supported: native::supported(),
-        enabled: policy.enabled,
-        paused: policy.paused,
-        total: counts.total,
-        pending: counts.pending,
-        completed: counts.completed,
-        failed: counts.failed,
-    })
-}
-
-/// Captures queue metadata only; recognition never runs on the capture path.
-pub(crate) async fn on_capture(core: &CoreInner, pool: &sqlx::SqlitePool, id: &str) -> Result<()> {
-    let _gate = core.ocr.gate.lock().await;
-    if !core.ocr.stopped.load(Ordering::SeqCst)
-        && native::supported()
-        && core.settings.snapshot().clipboard.ocr.enabled
-    {
-        repository::enqueue(pool, id).await?;
-        core.events.emit(CoreEvent::ImageOcrChanged);
-    }
-    Ok(())
-}
-
-pub(crate) fn settings_changed(core: &CoreInner) {
-    core.ocr.invalidate();
-    core.events.emit(CoreEvent::ImageOcrChanged);
-}
-
-/// Keep only a weak root between steps so dropping Core releases background work.
-pub(crate) fn spawn(core: &Arc<CoreInner>) {
-    let weak = Arc::downgrade(core);
-    let task = core.rt.spawn(async move {
-        loop {
-            if weak
-                .upgrade()
-                .is_none_or(|core| core.ocr.stopped.load(Ordering::SeqCst))
-            {
-                break;
-            }
-            if let Err(err) = step_with(weak.clone(), native::recognize).await {
-                log::warn!("image OCR queue step failed: {err}");
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
-    *core
-        .ocr
-        .worker
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
-}
-
-/// Native work may finish after shutdown, but its aborted publisher cannot write or emit.
-pub(crate) async fn shutdown(core: &CoreInner) {
-    let _gate = core.ocr.gate.lock().await;
-    core.ocr.stopped.store(true, Ordering::SeqCst);
-    core.ocr.invalidate();
-    let task = core
-        .ocr
-        .worker
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(task) = task {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
-/// Narrow synchronous recognition seam lets tests hold a real in-flight job across policy edits.
-async fn step_with<F>(weak: Weak<CoreInner>, recognize: F) -> Result<()>
-where
-    F: FnOnce(&Path) -> anyhow::Result<String> + Send + 'static,
-{
-    let (pool, job, path, generation, runtime) = {
-        let Some(core) = weak.upgrade() else {
-            return Ok(());
-        };
-        let _gate = core.ocr.gate.lock().await;
-        let policy = core.settings.snapshot().clipboard.ocr;
-        if core.ocr.stopped.load(Ordering::SeqCst)
-            || !native::supported()
-            || !policy.enabled
-            || policy.paused
-            || core.watcher_pause.is_paused()
-        {
-            return Ok(());
-        }
-        let pool = core.db.pool().await;
-        let Some(job) = repository::next_job(&pool).await? else {
-            return Ok(());
-        };
-        if crate::clipboard::validate_image_file_name(&job.content).is_err() {
-            repository::finish(&pool, &job, None).await?;
-            core.events.emit(CoreEvent::ImageOcrChanged);
-            return Ok(());
-        }
-        let path = core.images.origin_path(&job.content);
-        (pool, job, path, core.ocr.generation(), core.rt.clone())
-    };
-    let source = path.clone();
-    let recognized = runtime.spawn_blocking(move || recognize(&path)).await;
-    let Some(core) = weak.upgrade() else {
-        return Ok(());
-    };
-    let _gate = core.ocr.gate.lock().await;
-    let policy = core.settings.snapshot().clipboard.ocr;
-    if core.ocr.stopped.load(Ordering::SeqCst)
-        || !policy.enabled
-        || policy.paused
-        || generation != core.ocr.generation()
-        || pool.is_closed()
-        || core.watcher_pause.is_paused()
-        || source != core.images.origin_path(&job.content)
-    {
-        return Ok(());
-    }
-    let text = match recognized {
-        Ok(Ok(text)) => Some(text),
-        _ => None,
-    };
-    if repository::finish(&pool, &job, text.as_deref()).await? {
-        core.events.emit(CoreEvent::ImageOcrChanged);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::clipboard::{MemoryClipboard, MemoryState};
-    use crate::db::models::ClipboardItemQuery;
-    use crate::testing::{block_on, sample_png, Fixture};
-
-    fn queued_image(core: &Core) -> String {
-        let image = MemoryClipboard::with_state(MemoryState {
-            png: Some(sample_png(16, 16)),
-            ..Default::default()
-        });
-        let item = core
-            .build_item(&core.read_payload(&image).unwrap().unwrap())
-            .unwrap()
-            .unwrap();
-        let id = block_on(core.store_item(item, None)).unwrap().id;
-        id
-    }
-
-    fn stop_automatic_worker(core: &Core) {
-        if let Some(task) = core.0.ocr.worker.lock().unwrap().take() {
-            task.abort();
-        }
-    }
-
-    #[test]
-    fn image_ocr_capture_backfill_clear_and_reopen_preserve_history() {
-        let fixture = Fixture::new();
-        let core = fixture.start();
-        core.configure_image_ocr_models(&fixture.root().join("ocr-components"))
-            .unwrap();
-        stop_automatic_worker(&core);
-        let initial = block_on(core.image_ocr_status()).unwrap();
-        assert!(!initial.enabled);
-        assert_eq!(initial.total, 0);
-        block_on(core.update_settings(
-            serde_json::json!({"clipboard":{"ocr":{"enabled":true,"paused":true}}}),
-        ))
-        .unwrap();
-        let id = queued_image(&core);
-        assert_eq!(block_on(core.image_ocr_status()).unwrap().pending, 1);
-        assert_eq!(block_on(core.queue_image_ocr_history()).unwrap().pending, 1);
-        block_on(core.shutdown()).unwrap();
-        let reopened = fixture.start();
-        reopened
-            .configure_image_ocr_models(&fixture.root().join("ocr-components"))
-            .unwrap();
-        stop_automatic_worker(&reopened);
-        assert_eq!(block_on(reopened.image_ocr_status()).unwrap().pending, 1);
-        assert!(reopened.settings().clipboard.ocr.enabled);
-        assert!(reopened.settings().clipboard.ocr.paused);
-        let before = block_on(reopened.find_item(&id)).unwrap().unwrap();
-        let bytes = std::fs::read(reopened.image_origin_path(&before.content).unwrap()).unwrap();
-        let cleared = block_on(reopened.clear_image_ocr()).unwrap();
-        assert!(cleared.paused);
-        assert_eq!(cleared.total, 0);
-        let after = block_on(reopened.find_item(&id)).unwrap().unwrap();
-        assert_eq!(
-            serde_json::to_value(before).unwrap(),
-            serde_json::to_value(after.clone()).unwrap()
-        );
-        assert_eq!(
-            bytes,
-            std::fs::read(reopened.image_origin_path(&after.content).unwrap()).unwrap()
-        );
-        assert!(fixture
-            .take_events()
-            .iter()
-            .any(|event| matches!(event, CoreEvent::ImageOcrChanged)));
-        block_on(reopened.shutdown()).unwrap();
-    }
-
-    #[test]
-    fn image_ocr_serial_worker_rejects_results_after_clear_disable_switch_or_shutdown() {
-        for change in ["clear", "disable", "pause", "switch", "shutdown"] {
-            let fixture = Fixture::new();
-            let core = fixture.start();
-            core.configure_image_ocr_models(&fixture.root().join("ocr-components"))
-                .unwrap();
-            stop_automatic_worker(&core);
-            block_on(
-                core.update_settings(serde_json::json!({"clipboard":{"ocr":{"enabled":true}}})),
+    /// 返回已完成的识别文本（包括空文本），不改变历史记录。
+    pub async fn image_text(&self, id: &str) -> Result<Option<String>> {
+        let core = self.clone();
+        let id = id.to_owned();
+        self.hop(async move {
+            Ok(sqlx::query_scalar(
+                "SELECT text FROM image_texts WHERE item_id = ? AND status = 'done'",
             )
-            .unwrap();
-            queued_image(&core);
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let weak = Arc::downgrade(&core.0);
-            let worker = core.runtime().spawn(step_with(weak, move |_| {
-                started_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                Ok("stale invoice".into())
-            }));
-            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            match change {
-                "clear" => {
-                    block_on(core.clear_image_ocr()).unwrap();
-                }
-                "disable" => {
-                    block_on(core.update_settings(
-                        serde_json::json!({"clipboard":{"ocr":{"enabled":false}}}),
-                    ))
-                    .unwrap();
-                    block_on(core.update_settings(
-                        serde_json::json!({"clipboard":{"ocr":{"enabled":true}}}),
-                    ))
-                    .unwrap();
-                }
-                "pause" => {
-                    block_on(
-                        core.update_settings(
-                            serde_json::json!({"clipboard":{"ocr":{"paused":true}}}),
-                        ),
-                    )
-                    .unwrap();
-                    block_on(core.update_settings(
-                        serde_json::json!({"clipboard":{"ocr":{"paused":false}}}),
-                    ))
-                    .unwrap();
-                }
-                "switch" => {
-                    block_on(core.change_storage_location(fixture.root().join("new-location")))
-                        .unwrap();
-                }
-                "shutdown" => {
-                    block_on(core.shutdown()).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            fixture.take_events();
-            release_tx.send(()).unwrap();
-            block_on(worker).unwrap().unwrap();
-            assert!(
-                !fixture
-                    .take_events()
-                    .iter()
-                    .any(|event| matches!(event, CoreEvent::ImageOcrChanged)),
-                "late event after {change}"
-            );
-            if change == "shutdown" {
-                let reopened = fixture.start();
-                reopened
-                    .configure_image_ocr_models(&fixture.root().join("ocr-components"))
-                    .unwrap();
-                stop_automatic_worker(&reopened);
-                assert_eq!(block_on(reopened.image_ocr_status()).unwrap().completed, 0);
-                block_on(reopened.shutdown()).unwrap();
-            } else {
-                assert_eq!(
-                    block_on(core.image_ocr_status()).unwrap().completed,
-                    0,
-                    "late result after {change}"
-                );
-                let query = ClipboardItemQuery {
-                    keyword: Some("stale invoice".into()),
-                    ..Default::default()
-                };
-                assert_eq!(block_on(core.query_items_raw(query)).unwrap().1, 0);
-                block_on(core.shutdown()).unwrap();
-            }
+            .bind(id)
+            .fetch_optional(&core.0.db.pool().await)
+            .await
+            .map_err(anyhow::Error::from)?)
+        })
+        .await
+    }
+}
+
+/// 以同一设置快照补齐 UI 契约，不在 OCR 关闭时访问派生表。
+pub(crate) async fn attach_view(
+    pool: &sqlx::SqlitePool,
+    view: &mut crate::presenter::ClipboardItemView,
+    query: &crate::db::models::ClipboardItemQuery,
+) -> Result<()> {
+    use crate::presenter::ClipboardAction;
+    if !query.ocr_enabled || view.item.kind != crate::db::models::ClipboardKind::Image {
+        return Ok(());
+    }
+    let (has_text, matched) =
+        crate::db::items::image_text_flags(pool, &view.item.id, query.keyword.as_deref()).await?;
+    view.has_image_text = has_text;
+    view.image_text_matched = matched;
+    if matched {
+        if let Some(keyword) = query.keyword.as_deref() {
+            let text: Option<String> = sqlx::query_scalar(
+                "SELECT text FROM image_texts WHERE item_id = ? AND status = 'done'",
+            )
+            .bind(&view.item.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(anyhow::Error::from)?;
+            view.image_text_snippet = text.and_then(|text| snippet(&text, keyword));
         }
     }
-
-    #[test]
-    fn image_ocr_success_and_failed_attempts_emit_status_and_do_not_loop() {
-        let fixture = Fixture::new();
-        let core = fixture.start();
-        core.configure_image_ocr_models(&fixture.root().join("ocr-components"))
-            .unwrap();
-        stop_automatic_worker(&core);
-        block_on(core.update_settings(serde_json::json!({"clipboard":{"ocr":{"enabled":true}}})))
-            .unwrap();
-        queued_image(&core);
-        block_on(
-            core.runtime()
-                .spawn(step_with(Arc::downgrade(&core.0), |_| {
-                    Err(anyhow::anyhow!("fixture failure"))
-                })),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(block_on(core.image_ocr_status()).unwrap().failed, 1);
-        block_on(
-            core.runtime()
-                .spawn(step_with(Arc::downgrade(&core.0), |_| {
-                    panic!("failed jobs must not be retried automatically")
-                })),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(block_on(core.queue_image_ocr_history()).unwrap().pending, 1);
-        block_on(
-            core.runtime()
-                .spawn(step_with(Arc::downgrade(&core.0), |_| {
-                    Ok("本地 invoice".into())
-                })),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(block_on(core.image_ocr_status()).unwrap().completed, 1);
-        assert_eq!(
-            block_on(core.query_items_raw(ClipboardItemQuery {
-                keyword: Some("本地".into()),
-                ..Default::default()
-            }))
-            .unwrap()
-            .1,
-            1
-        );
-        block_on(core.shutdown()).unwrap();
+    if has_text {
+        if let Some(index) = view
+            .available_actions
+            .iter()
+            .position(|action| *action == ClipboardAction::SaveImage)
+        {
+            view.available_actions
+                .insert(index + 1, ClipboardAction::CopyImageText);
+        }
     }
+    Ok(())
 }

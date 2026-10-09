@@ -4,7 +4,7 @@ name: Native CI
 #
 #   check  Windows x64：vendored GPUI 与“原版 + 补丁”逐字节一致、补丁版确实被用上、4 个发布目标都没有
 #          rustls / ring、UI 分层与颜色 token 守卫、fmt、clippy、测试，以及更新器在 e2e-overrides 特性下的 clippy 与测试。
-#   core-macos  macOS 上跑 kwikpaste-core、kwikpaste-os、kwikpaste-updater 的测试：迁移校验和在 macOS 是 LF 那一侧；
+#   core-macos  macOS 上跑完整 workspace 测试与严格 clippy：迁移校验和在 macOS 是 LF 那一侧；
 #               os 的应用包扫描、NSSound 解码提示音和更新器的换包代码只在 macOS 上编译，本机没有 Mac。
 #   build  4 个发布目标的 release 构建，配置与以后发布一致（Windows 静态 CRT，macOS 最低 10.15）。
 #   smoke  在 4 个目标上真正启动应用：`--selftest-smoke` 打开窗口、几秒后正常退出，看退出码。
@@ -12,7 +12,7 @@ name: Native CI
 #          Windows x64 另跑 tools/platform-probes/panel-invariants.ps1：面板窗口样式、MA_NOACTIVATE、
 #          显示位置、最小尺寸、不抢前台。它不注入键鼠，只要有桌面会话。
 #   installer-size  用 build 的 Windows exe 按发布流水线的方式打 NSIS 安装包（不签名、不上传），按 MiB 报体积：
-#          超过 14 MiB 警告，超过 16 MiB 失败（scripts/ci/lib/size.mjs）。单独成 job，超预算不影响 smoke。
+#          超过 5.5 MiB 警告，超过 6 MiB 失败（scripts/ci/lib/size.mjs）。单独成 job，超预算不影响 smoke。
 #
 # 1.x 的 Tauri 版（src/、src-tauri/）不在这里检查，见 pr-check.yml 和 release.yml。
 
@@ -33,7 +33,6 @@ name: Native CI
       - "packaging/**"
       - "scripts/release/**"
       - "scripts/package-portable.ps1"
-      - "scripts/prepare-windows-ocr.ps1"
       - ".github/workflows/release.yml"
       - ".github/workflows/channel-pointer.yml"
       - ".github/workflows/channel-pointer-v2.yml"
@@ -59,7 +58,6 @@ name: Native CI
       - "packaging/**"
       - "scripts/release/**"
       - "scripts/package-portable.ps1"
-      - "scripts/prepare-windows-ocr.ps1"
       - ".github/workflows/release.yml"
       - ".github/workflows/channel-pointer.yml"
       - ".github/workflows/channel-pointer-v2.yml"
@@ -70,11 +68,6 @@ name: Native CI
       - "rust-toolchain.toml"
       - ".github/workflows/native-ci.yml"
   workflow_dispatch:
-    inputs:
-      package_test_build:
-        description: "Build and validate installable OCR test packages without publishing a release"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -87,10 +80,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test-packages:
-    if: github.event_name == 'workflow_dispatch' && inputs.package_test_build
-    uses: ./.github/workflows/native-release.yml
-
   check:
     name: Check (Windows x64)
     runs-on: windows-latest
@@ -144,16 +133,6 @@ jobs:
         with:
           key: native-check
 
-      - name: Native OCR dependency cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/kwikpaste-windows-ocr
-          key: ocr-deps-${{ runner.os }}-${{ runner.arch }}-x86_64-pc-windows-msvc-${{ hashFiles('scripts/prepare-windows-ocr.ps1') }}
-
-      - name: Prepare bundled offline Windows OCR
-        shell: pwsh
-        run: ./scripts/prepare-windows-ocr.ps1 -Architecture x64
-
       - name: Format
         shell: bash
         run: cargo fmt --check
@@ -202,7 +181,7 @@ jobs:
           cargo test --locked -p kwikpaste-updater --features e2e-overrides
 
   core-macos:
-    name: Core, OS and updater tests (macOS)
+    name: Workspace tests and clippy (macOS)
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -219,32 +198,10 @@ jobs:
           key: native-core-macos
 
       - name: Test
-        run: cargo test --locked -p kwikpaste-core -p kwikpaste-os -p kwikpaste-updater
+        run: cargo test --locked --workspace
 
-      - name: Updater clippy
-        run: cargo clippy --locked -p kwikpaste-updater --no-deps --all-targets -- -D warnings
-
-  ocr-windows-arm64:
-    name: Real offline OCR tests (Windows ARM64)
-    runs-on: windows-11-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          targets: aarch64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: native-ocr-arm64
-      - name: Native OCR dependency cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/kwikpaste-windows-ocr
-          key: ocr-deps-${{ runner.os }}-${{ runner.arch }}-aarch64-pc-windows-msvc-${{ hashFiles('scripts/prepare-windows-ocr.ps1') }}
-      - name: Prepare bundled offline Windows OCR
-        shell: pwsh
-        run: ./scripts/prepare-windows-ocr.ps1 -Architecture arm64
-      - name: Test native engine with real English and Chinese images
-        run: cargo test --locked -p kwikpaste-core ocr::native -- --nocapture
+      - name: Workspace clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   build:
     name: Build ${{ matrix.label }}
@@ -299,18 +256,6 @@ jobs:
           if (-not (Test-Path $fxc)) { throw "fxc.exe not found at $fxc" }
           "GPUI_FXC_PATH=$fxc" >> $env:GITHUB_ENV
 
-      - name: Native OCR dependency cache
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/kwikpaste-windows-ocr
-          key: ocr-deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/prepare-windows-ocr.ps1') }}
-
-      - name: Prepare bundled offline Windows OCR
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/prepare-windows-ocr.ps1 -Architecture ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'arm64' || 'x64' }}
-
       - name: Build
         shell: bash
         env:
@@ -319,11 +264,6 @@ jobs:
           CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
           MACOSX_DEPLOYMENT_TARGET: "10.15"
         run: cargo build --locked --release -p kwikpaste-app --target ${{ matrix.target }}
-
-      - name: Stage OCR notices
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Copy-Item crates/kwikpaste-core/assets/ocr/OCR-NOTICES.txt target/${{ matrix.target }}/release/OCR-NOTICES.txt
 
       # 图标组 ID 1（GPUI 的窗口图标）、VERSIONINFO、只有 GPUI 那一个 manifest、不导入 C 运行库（+crt-static）。
       - name: Check Windows binary
@@ -349,9 +289,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: KwikPaste-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/KwikPaste${{ runner.os == 'Windows' && '.exe' || '' }}
-            target/${{ matrix.target }}/release/OCR-NOTICES.txt
+          path: target/${{ matrix.target }}/release/KwikPaste${{ runner.os == 'Windows' && '.exe' || '' }}
           if-no-files-found: error
           retention-days: 7
 
@@ -461,6 +399,21 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File source/tools/platform-probes/panel-invariants.ps1 -Exe ./KwikPaste.exe -Rounds 20
+
+      # 只在一次性测试 runner 上驱动脚本自己的窗口和合成剪贴板；进程使用 selftest 独立身份。
+      - name: Paste into synthetic Windows targets
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: powershell -STA -NoProfile -ExecutionPolicy Bypass -File source/tools/platform-probes/paste.ps1 -Exe ./KwikPaste.exe -Rounds 3 -IdleSeconds 0 -UiPanel -QuickPaste -PastePlain
+
+      - name: Image paste and clipboard writeback on Windows
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: powershell -STA -NoProfile -ExecutionPolicy Bypass -File source/tools/platform-probes/image-paste.ps1 -Exe ./KwikPaste.exe -IdleSeconds 0
 
       - name: Upload panel probe results
         if: failure() && matrix.target == 'x86_64-pc-windows-msvc'

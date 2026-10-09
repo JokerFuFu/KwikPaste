@@ -98,19 +98,6 @@ impl Selection {
         self.all_checked = true;
     }
 
-    /// 异步全选只允许写回发起查询时的视图代号，索引变化后的旧结果不重新勾选原始记录。
-    pub fn check_all_if_current(
-        &mut self,
-        token: u64,
-        ids: impl IntoIterator<Item = Arc<str>>,
-    ) -> bool {
-        if token != self.token {
-            return false;
-        }
-        self.check_all(ids);
-        true
-    }
-
     /// 某条记录不在视图里了（删除、移出），从勾选里拿掉。
     pub fn forget(&mut self, id: &str) {
         self.checked.remove(id);

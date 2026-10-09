@@ -30,6 +30,10 @@ pub enum CommandKey {
     ExportExcelLimit,
     BackupPartialOverwrite,
 
+    PasteBusy,
+    PasteHandoffFailed,
+    PastePermissionMissing,
+
     DragSourceFilesMissing,
     DragImageMissing,
     DragTextEmpty,
@@ -38,6 +42,10 @@ pub enum CommandKey {
     SplitTextOnly,
     SplitSensitiveRedacted,
     PortableStorageFixed,
+    StorageInsufficientSpace,
+    StorageSpaceUnavailable,
+    StorageTargetHasData,
+    StorageCustomUnavailable,
     SyncNotRunning,
     SyncInvalidCode,
     SyncWrongCode,

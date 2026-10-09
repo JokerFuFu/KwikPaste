@@ -35,7 +35,8 @@ pub mod window_state;
 pub use env::{AppEnv, AppInfo, CoreOptions, APP_IDENTIFIER, APP_NAME};
 pub use error::{AppError, Result};
 pub use events::{CoreEvent, EventSink, NoopSink};
-pub use ocr::ImageOcrStatus;
-pub use paths::{CorePaths, StorageLocation};
+pub use paths::{cloud_sync_provider, CorePaths, StorageLocation};
 pub use root::Core;
 pub use runtime::CoreRuntime;
+
+pub use ocr::{OcrStatus, OcrSupport, TextSnippet};

@@ -79,6 +79,46 @@ fn every_released_settings_file_loads_without_fallback() {
             "{name}: {report:?}"
         );
         assert!(!report.history_degraded(), "{name}");
+        assert!(
+            !store.snapshot().clipboard.ocr.enabled,
+            "{name}: OCR must remain opt-in"
+        );
+        assert_eq!(
+            store.snapshot().clipboard.feedback.copy_sound_volume,
+            100,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn missing_copy_sound_volume_preserves_old_feedback_and_defaults_to_full_volume() {
+    for sound in [false, true] {
+        let json = format!(r#"{{"clipboard":{{"feedback":{{"copySound":{sound}}}}}}}"#);
+        let settings: Settings = serde_json::from_str(&json).unwrap();
+        let (_temp, _paths, store) = load(&json);
+        assert_eq!(settings.clipboard.feedback.copy_sound, sound);
+        assert_eq!(settings.clipboard.feedback.copy_sound_volume, 100);
+        assert_eq!(
+            store.snapshot().clipboard.feedback,
+            settings.clipboard.feedback
+        );
+        assert!(store.load_report().fallbacks.is_empty());
+    }
+    let settings: Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(settings.clipboard.feedback.copy_sound_volume, 100);
+}
+
+#[test]
+fn copy_sound_volume_round_trips_as_a_camel_case_number() {
+    for volume in [0, 50, 100, 255] {
+        let mut settings = Settings::default();
+        settings.clipboard.feedback.copy_sound = true;
+        settings.clipboard.feedback.copy_sound_volume = volume;
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["clipboard"]["feedback"]["copySoundVolume"], volume);
+        let restored: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, settings);
     }
 }
 
@@ -138,11 +178,8 @@ fn customized_settings_round_trip_exactly() {
     expected["shortcuts"]["pauseInFullscreen"] = Value::Bool(true);
     expected["shortcuts"]["pauseAppIds"] = Value::Array(Vec::new());
     expected["shortcuts"]["pastePlain"] = Value::String(String::new());
-    expected["clipboard"]
-        .as_object_mut()
-        .unwrap()
-        .entry("ocr")
-        .or_insert_with(|| serde_json::json!({"enabled": false, "paused": false}));
+    expected["clipboard"]["feedback"]["copySoundVolume"] = Value::from(100);
+    expected["clipboard"]["ocr"] = serde_json::json!({"enabled": false});
     // 2.x 删掉了 1.x 的更新渠道开关。
     let update = expected["update"].as_object_mut().unwrap();
     update.remove("includeBeta");
@@ -171,40 +208,6 @@ fn customized_settings_round_trip_exactly() {
     .unwrap();
     assert_eq!(reread, saved);
     assert_eq!(reread.clipboard, store.snapshot().clipboard);
-}
-
-#[test]
-fn image_ocr_defaults_and_explicit_choices_survive_legacy_settings_save() {
-    let content = fs::read_to_string(fixtures_dir().join("v1.4.0-customized.json")).unwrap();
-    for choice in [
-        None,
-        Some(serde_json::json!({"enabled": true})),
-        Some(serde_json::json!({"paused": true})),
-        Some(serde_json::json!({"enabled": true, "paused": true})),
-        Some(serde_json::json!({"enabled": false, "paused": true})),
-    ] {
-        let mut original: Value = serde_json::from_str(&content).unwrap();
-        if let Some(choice) = choice {
-            original["clipboard"]["ocr"] = choice;
-        }
-        let expected_enabled = original["clipboard"]["ocr"]["enabled"]
-            .as_bool()
-            .unwrap_or(false);
-        let expected_paused = original["clipboard"]["ocr"]["paused"]
-            .as_bool()
-            .unwrap_or(false);
-        let original = original.to_string();
-        let (_temp, paths, store) = load(&original);
-        let path = paths.config_dir().unwrap().join("settings.json");
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        let saved = store
-            .update(serde_json::json!({"appearance": {"theme": "light"}}))
-            .unwrap();
-        let reread: Settings = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(reread, saved);
-        assert_eq!(reread.clipboard.ocr.enabled, expected_enabled);
-        assert_eq!(reread.clipboard.ocr.paused, expected_paused);
-    }
 }
 
 #[test]

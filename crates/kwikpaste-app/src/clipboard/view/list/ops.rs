@@ -79,7 +79,6 @@ impl ClipboardList {
         let old = &self.settings.clipboard;
         let new = &settings.clipboard;
         let resort = old.content.sort != new.content.sort;
-        let ocr_search_changed = old.ocr.enabled != new.ocr.enabled;
         let refresh = old.display != new.display || old.sensitive != new.sensitive;
         let preview_changed = old.preview != new.preview;
         // 风格、密度、行数、图片高度变了：行高全变，像换排序一样整体重排。
@@ -91,11 +90,8 @@ impl ClipboardList {
         if preview_changed {
             self.preview_settings_changed(cx);
         }
-        if ocr_search_changed {
-            self.selection.reset();
-        }
 
-        if resort || relayout || ocr_search_changed {
+        if resort || relayout {
             self.reload_from_scratch(cx);
         } else if refresh && let Some(request) = self.model.reload_current_range() {
             self.fetch(request, cx);
@@ -185,7 +181,7 @@ impl ClipboardList {
         self.activate(Activation::Paste { plain }, cx);
     }
 
-    /// Mod+数字：粘贴第 N 个可见非置顶项。多选时不响应（也不显示角标）；数据没追上时同 Enter 挂起。
+    /// Mod+数字：粘贴第 N 个可见项（包含置顶行）。多选时不响应（也不显示角标）；数据没追上时同 Enter 挂起。
     pub fn quick_paste(&mut self, key: char, cx: &mut Context<Self>) {
         if self.selection.active() {
             return;
@@ -327,6 +323,22 @@ impl ClipboardList {
         .detach();
     }
 
+    /// 复制图片里识别出的文字（右键菜单「复制图中文字」）。
+    pub fn copy_image_text(&mut self, id: Arc<str>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_preview_of(&id, cx);
+        let task = self.host.copy_image_text(id, cx);
+
+        cx.spawn_in(window, async move |list, cx| {
+            let result = task.await;
+            list.update_in(cx, |_, window, cx| match result {
+                Ok(()) => Self::toast_success("commands:messages.copied", window, cx),
+                Err(err) => Self::toast_error("commands:labels.copyImageText", &err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn show_copied(&mut self, id: Arc<str>, action: QuickAction, cx: &mut Context<Self>) {
         self.copied = Some((id, action));
         self.copied_reset = Some(cx.spawn(async move |list, cx| {
@@ -396,7 +408,6 @@ impl ClipboardList {
                         "commands:messages.itemUnpinned"
                     };
                     Self::toast_success(key, window, cx);
-                    list.patch_item(&id, |item| item.is_pinned = pinned, cx);
                     if let Some(request) = list.model.reload_current_range() {
                         list.fetch(request, cx);
                     }

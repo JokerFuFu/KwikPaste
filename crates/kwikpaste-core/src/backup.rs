@@ -593,6 +593,7 @@ async fn stage_scoped_source(
         .context("failed to open the partial backup database")?;
     let pruned = async {
         prune_to_scope(&copy, scope).await?;
+        strip_ocr_backup(&copy).await?;
         let counts = load_counts(&copy).await?;
         let images = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT content FROM clipboard_items WHERE kind = 'image'",
@@ -652,6 +653,21 @@ async fn stage_scoped_source(
     .await?;
 
     Ok((staged, counts))
+}
+
+/// 部分备份不带图片识别文字：删掉派生的 OCR 正文、重建它的索引再 VACUUM，删掉的文字不留在索引段或空闲页里。
+async fn strip_ocr_backup(pool: &SqlitePool) -> Result<()> {
+    for statement in [
+        "DELETE FROM image_texts",
+        "INSERT INTO image_texts_fts(image_texts_fts) VALUES ('rebuild')",
+        "VACUUM",
+    ] {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .context("failed to strip derived OCR data from backup")?;
+    }
+    Ok(())
 }
 
 /// 删掉范围外的记录，以及不再被引用的分组、来源应用和全部文件类型图标（缓存，键里可能有完整路径）。
@@ -1169,6 +1185,7 @@ async fn merge_import(
     let imported_resources = blocking(move || copy_dir_missing(&resources, &resources_dir)).await?;
     refresh_apps_registry(core).await;
     core.events.emit(CoreEvent::ClipboardReloaded);
+    core.ocr.nudge();
 
     let mut imported_settings = false;
     if import_settings {
@@ -1177,7 +1194,6 @@ async fn merge_import(
         // 部分备份的设置是 `{}`：没有可合并的，也就不用通知宿主重新应用。
         if patch.as_object().is_none_or(|object| !object.is_empty()) {
             let delta = SettingsDelta::from_patch(&patch);
-            let _ocr = core.ocr.gate.lock().await;
             let next = core.settings.update(patch)?;
             apply_imported_settings(core, next, delta);
             imported_settings = true;
@@ -1211,10 +1227,9 @@ async fn overwrite_import(
     {
         // 先停新的采集，再等在途的入库与清理结束，换库期间没有人写库或删图片文件。
         let _pause = core.watcher_pause.pause_scoped();
+        let _ocr = core.ocr.suspend().await;
         let _upsert = core.upsert_lock.lock().await;
         let _exclusive = core.cleanup.exclusive().await;
-        let _ocr = core.ocr.gate.lock().await;
-        core.ocr.invalidate();
 
         let live = crate::db::db_path(&core.paths)?;
         let staged =
@@ -1238,11 +1253,11 @@ async fn overwrite_import(
 
         refresh_apps_registry(core).await;
         core.events.emit(CoreEvent::ClipboardReloaded);
+        core.ocr.nudge();
     }
 
     let imported_settings = settings.is_some();
     if let Some(settings) = settings {
-        let _ocr = core.ocr.gate.lock().await;
         let next = core.settings.replace(settings)?;
         apply_imported_settings(core, next, SettingsDelta::replaced());
     }
@@ -1635,7 +1650,7 @@ fn apply_imported_settings(
     delta: SettingsDelta,
 ) {
     if delta.touches("clipboard.ocr") {
-        crate::ocr::settings_changed(core);
+        core.ocr.settings_changed();
     }
     if delta.touches("clipboard.history") {
         clipboard::cleanup::request(core);
@@ -1749,3 +1764,99 @@ fn app_error<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod migration_compat_tests {
+    use super::*;
+    use crate::db::init::migration_compat_tests::{
+        author_database, columns, historical_database, snapshot,
+    };
+
+    async fn fixture_pool(path: &Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Exercise the same staging/adoption path as overwrite import using released fork SQL.
+    #[tokio::test]
+    async fn stage_released_fork_eight_preserves_source_history_cache_and_platform_checksums() {
+        for crlf in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("released.db");
+            let live = dir.path().join("live.db");
+            fs::write(&live, b"live database untouched").unwrap();
+            let pool = fixture_pool(&source).await;
+            historical_database(&pool, 8, crlf).await;
+            let item_columns = columns(&pool, "clipboard_items").await;
+            let cache_columns = columns(&pool, "image_ocr").await;
+            let items = snapshot(&pool, "clipboard_items", &item_columns).await;
+            let cache = snapshot(&pool, "image_ocr", &cache_columns).await;
+            checkpoint_database(&pool).await.unwrap();
+            pool.close().await;
+            let original_bytes = fs::read(&source).unwrap();
+
+            let staged = stage_backup_database(&source, &live).await.unwrap();
+            assert_eq!(fs::read(&source).unwrap(), original_bytes);
+            assert_eq!(fs::read(&live).unwrap(), b"live database untouched");
+            let pool = fixture_pool(&staged).await;
+            assert_eq!(
+                snapshot(&pool, "clipboard_items", &item_columns).await,
+                items
+            );
+            assert_eq!(snapshot(&pool, "image_ocr", &cache_columns).await, cache);
+            let rows: Vec<(i64, Vec<u8>)> =
+                sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows.len(), 9);
+            for ((version, checksum), embedded) in rows.iter().zip(crate::db::MIGRATOR.iter()) {
+                assert_eq!(*version, embedded.version);
+                assert_eq!(checksum.as_slice(), embedded.checksum.as_ref());
+            }
+            pool.close().await;
+        }
+    }
+
+    /// Both conflicting native 8 and unknown checksums fail before replacing the live DB.
+    #[tokio::test]
+    async fn stage_rejects_author_native_eight_and_unknown_ledger_without_changing_source_or_live()
+    {
+        for (author, crlf) in [(false, false), (false, true), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("incompatible.db");
+            let live = dir.path().join("live.db");
+            fs::write(&live, b"live database untouched").unwrap();
+            let pool = fixture_pool(&source).await;
+            if author {
+                author_database(&pool, crlf).await;
+            } else {
+                historical_database(&pool, 8, crlf).await;
+                sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 8")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            checkpoint_database(&pool).await.unwrap();
+            pool.close().await;
+            let original_bytes = fs::read(&source).unwrap();
+
+            let err = stage_backup_database(&source, &live).await.unwrap_err();
+            assert!(err.to_string().contains("不兼容"), "{err}");
+            assert_eq!(fs::read(&source).unwrap(), original_bytes);
+            assert_eq!(fs::read(&live).unwrap(), b"live database untouched");
+            let staged = sibling(&live, STAGED_DB_SUFFIX);
+            assert!(!staged.exists());
+            assert!(!sibling(&staged, "-wal").exists());
+            assert!(!sibling(&staged, "-shm").exists());
+        }
+    }
+}

@@ -175,7 +175,7 @@ impl ClipboardList {
                             }
                             return;
                         }
-                        list.selection.check_all_if_current(token, ids);
+                        list.selection.check_all(ids);
                     }
                     Err(err) => {
                         Self::toast_error("commands:labels.selectClipboardItems", &err, window, cx)

@@ -1,6 +1,6 @@
 //! 列表控制器：当前项、键盘移动、数字提示和刷新策略，移植自 1.x `List.tsx` 的逻辑部分。
 //!
-//! - 当前项（“选中”）只有一个：没有显式选中时，第一个可见的非置顶项就是当前项；
+//! - 当前项（“选中”）只有一个：没有显式选中时，第一个可见的项就是当前项；
 //!   指针移进卡片就把它设为当前项，键盘和指针共用一个选中。
 //! - ↑/↓ 夹在首尾、不循环；目标行没加载时先发请求，这一次移动作废（与 1.x 相同）。
 //! - 剪贴板有新内容时：面板隐藏时立即重拉第一页（再显示总会回到顶部，显示时数据已经是新的）；
@@ -24,7 +24,7 @@ pub enum Nav {
 /// 一次方向键的结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavOutcome {
-    /// 当前项移到了模型下标 `index`，视图把它平滑滚进视口（置顶行不滚）。
+    /// 当前项移到了模型下标 `index`，视图把它平滑滚进视口。
     Moved { index: usize },
     /// 目标行还没加载：已登记为可见范围，等数据到了再按。
     NeedsLoad { index: usize },
@@ -41,8 +41,8 @@ pub enum ListUpdate {
     Cleaned { removed: u64 },
     /// 历史数据整体换了一份：导入备份、切换存储位置（core `ClipboardReloaded`，1.x `imported`）。
     Reloaded,
-    /// 图片派生索引或其搜索开关变化，不伪造剪贴板记录 id。
-    SearchIndexChanged,
+    /// 图片文字识别有了进展或开关变了（core `OcrChanged`）：只影响带关键词的搜索结果。
+    ImageTextChanged,
 }
 
 /// 收到列表变化后要做的事。
@@ -52,20 +52,20 @@ pub enum UpdateAction {
     Ignore,
     /// 已在顶部：立即重拉第一页。
     ReloadNow {
-        /// 清空批量勾选并作废异步选择结果；当前项光标由控制器独立处理。
+        /// 同时清掉当前选中（清理、导入时）。
         reset_selection: bool,
     },
     /// 不在顶部或面板隐藏：记成挂起，回到顶部再刷新。
     Defer { reset_selection: bool },
 }
 
-/// 数字提示 1–9、0（Mod+数字粘贴第 N 个可见非置顶项）。
+/// 数字提示 1–9、0（Mod+数字粘贴第 N 个可见项）。
 pub const HINT_KEYS: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
 
 #[derive(Debug, Default)]
 pub struct ListController {
     selected: Option<Arc<str>>,
-    /// 第一个可见的非置顶项的模型下标（列表视口第一行 + 置顶行数）。
+    /// 第一个可见的项的模型下标（包含置顶行）。
     first_visible: usize,
     pending_reload: bool,
     filter: ListFilter,
@@ -116,7 +116,7 @@ impl ListController {
         }
     }
 
-    /// 当前项的模型下标：显式选中且仍在缓存里时取它，否则取第一个可见的非置顶项。
+    /// 当前项的模型下标：显式选中且仍在缓存里时取它，否则取第一个可见的项。
     pub fn active_index(&self, model: &ListModel) -> usize {
         self.selected
             .as_deref()
@@ -124,7 +124,7 @@ impl ListController {
             .unwrap_or(self.first_visible)
     }
 
-    /// Enter 作用的记录（1.x：显式选中项，否则第一个可见非置顶项，再否则第 0 行）。
+    /// Enter 作用的记录（1.x：显式选中项，否则第一个可见项，再否则第 0 行）。
     pub fn active_item<'a>(&self, model: &'a ListModel) -> Option<&'a Arc<ListItem>> {
         if let Some(item) = self.selected.as_deref().and_then(|id| model.find(id)) {
             return Some(item);
@@ -187,9 +187,9 @@ impl ListController {
             .map(|item| item.id.clone());
     }
 
-    /// 第 `index` 行的数字提示：只标在前 10 个可见非置顶项上，多选时不显示。
-    pub fn hint_key(&self, index: usize, pinned: usize, selecting: bool) -> Option<char> {
-        if selecting || index < pinned {
+    /// 第 `index` 行的数字提示：只标在前 10 个可见项上，多选时不显示。
+    pub fn hint_key(&self, index: usize, selecting: bool) -> Option<char> {
+        if selecting {
             return None;
         }
 
@@ -197,7 +197,7 @@ impl ListController {
         HINT_KEYS.get(relative).copied()
     }
 
-    /// Mod+数字：数字键对应的模型下标（`1` 是第一个可见非置顶项，`0` 是第十个）。
+    /// Mod+数字：数字键对应的模型下标（`1` 是第一个可见项，`0` 是第十个）。
     pub fn hint_index(&self, key: char) -> Option<usize> {
         HINT_KEYS
             .iter()
@@ -207,13 +207,6 @@ impl ListController {
 
     /// 列表变化的处理决定（1.x `handleClipboardUpdated` + `requestReloadAtTop`）。
     pub fn on_update(&mut self, update: ListUpdate, visible: bool, at_top: bool) -> UpdateAction {
-        if update == ListUpdate::SearchIndexChanged {
-            // 索引关闭或清除会让命中消失，正在浏览和隐藏的窗口都必须及时重查当前过滤条件。
-            self.pending_reload = false;
-            return UpdateAction::ReloadNow {
-                reset_selection: true,
-            };
-        }
         let reset_selection = match update {
             ListUpdate::Cleaned { .. } | ListUpdate::Reloaded => true,
             ListUpdate::Upserted { kind, .. } => {
@@ -222,7 +215,12 @@ impl ListController {
                 }
                 false
             }
-            ListUpdate::SearchIndexChanged => true,
+            ListUpdate::ImageTextChanged => {
+                if !self.filter.searching() || !self.filter.may_include(Some(ItemKind::Image)) {
+                    return UpdateAction::Ignore;
+                }
+                false
+            }
         };
         if reset_selection {
             self.selected = None;
@@ -313,6 +311,8 @@ mod tests {
             color_preview: None,
             quick_snippets: Vec::new(),
             image_display: None,
+            has_image_text: false,
+            image_text_snippet: None,
         })
     }
 
@@ -331,16 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn default_active_item_is_the_first_visible_non_pinned_row() {
+    fn default_active_item_is_the_first_visible_row_including_pins() {
         let model = model(100, 30, 2);
         let mut controller = ListController::new();
-        controller.set_first_visible(2);
-
-        assert!(controller.is_active(2, "r2"));
+        assert!(controller.is_active(0, "r0"));
+        assert_eq!(
+            controller.active_item(&model).map(|item| &*item.id),
+            Some("r0")
+        );
+        controller.set_first_visible(1);
+        assert!(controller.is_active(1, "r1"));
+        assert_eq!(controller.active_index(&model), 1);
+        controller.set_first_visible(5);
         assert!(!controller.is_active(0, "r0"));
         assert_eq!(
             controller.active_item(&model).map(|item| &*item.id),
-            Some("r2")
+            Some("r5")
         );
     }
 
@@ -402,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn up_from_the_first_regular_row_reaches_pinned_rows() {
+    fn arrows_cross_the_pinned_boundary_and_reach_the_top() {
         let mut model = model(50, 30, 2);
         let mut controller = ListController::new();
         controller.set_first_visible(2);
@@ -410,6 +416,18 @@ mod tests {
         assert_eq!(
             controller.navigate(Nav::Up, &mut model).0,
             NavOutcome::Moved { index: 1 }
+        );
+        assert_eq!(
+            controller.navigate(Nav::Up, &mut model).0,
+            NavOutcome::Moved { index: 0 }
+        );
+        assert_eq!(
+            controller.navigate(Nav::Down, &mut model).0,
+            NavOutcome::Moved { index: 1 }
+        );
+        assert_eq!(
+            controller.navigate(Nav::Down, &mut model).0,
+            NavOutcome::Moved { index: 2 }
         );
     }
 
@@ -432,25 +450,19 @@ mod tests {
     }
 
     #[test]
-    fn number_hints_cover_ten_visible_regular_rows() {
+    fn number_hints_cover_ten_visible_rows_including_pins() {
         let mut controller = ListController::new();
+        assert_eq!(controller.hint_key(0, false), Some('1'));
+        assert_eq!(controller.hint_key(1, false), Some('2'));
+        assert_eq!(controller.hint_index('1'), Some(0));
         controller.set_first_visible(5);
 
-        assert_eq!(controller.hint_key(5, 2, false), Some('1'));
-        assert_eq!(controller.hint_key(13, 2, false), Some('9'));
-        assert_eq!(controller.hint_key(14, 2, false), Some('0'));
-        assert_eq!(controller.hint_key(15, 2, false), None);
-        assert_eq!(controller.hint_key(4, 2, false), None);
-        assert_eq!(
-            controller.hint_key(1, 2, false),
-            None,
-            "pinned rows get no hint"
-        );
-        assert_eq!(
-            controller.hint_key(6, 2, true),
-            None,
-            "hidden while selecting"
-        );
+        assert_eq!(controller.hint_key(5, false), Some('1'));
+        assert_eq!(controller.hint_key(13, false), Some('9'));
+        assert_eq!(controller.hint_key(14, false), Some('0'));
+        assert_eq!(controller.hint_key(15, false), None);
+        assert_eq!(controller.hint_key(4, false), None);
+        assert_eq!(controller.hint_key(6, true), None, "hidden while selecting");
     }
 
     #[test]
@@ -524,81 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn image_ocr_membership_change_clears_checked_rows_and_rejects_pending_select_all() {
-        use super::super::selection::Selection;
-
-        let mut model = ListModel::new();
-        let request = model.reset_and_reload();
-        let images = ["r0", "r1"]
-            .into_iter()
-            .map(|id| {
-                let mut image = item(id, false);
-                Arc::make_mut(&mut image).kind = ItemKind::Image;
-                image
-            })
-            .collect();
-        model.apply(
-            &request,
-            Page {
-                items: images,
-                total: 2,
-            },
-        );
-        let mut controller = ListController::new();
-        controller.set_filter(ListFilter {
-            category: Some(ItemKind::Image),
-            keyword: "ocr-only".into(),
-            ..ListFilter::default()
-        });
-        controller.select(&"r0".into());
-        let mut selection = Selection::default();
-        selection.enter();
-        let pending_token = selection.token();
-        assert!(selection.check_all_if_current(pending_token, ["r0".into(), "r1".into()]));
-
-        let action = controller.on_update(ListUpdate::SearchIndexChanged, true, false);
-        if matches!(
-            action,
-            UpdateAction::ReloadNow {
-                reset_selection: true
-            }
-        ) {
-            selection.reset();
-        }
-        let request = model.reload();
-        model.apply(
-            &request,
-            Page {
-                items: Vec::new(),
-                total: 0,
-            },
-        );
-
-        assert_eq!(model.total(), 0, "OCR-only rows no longer match");
-        assert!(
-            selection.ids().is_empty(),
-            "bulk delete must not retain invisible originals"
-        );
-        assert_ne!(
-            selection.token(),
-            pending_token,
-            "pending select-all must be invalidated"
-        );
-        assert!(!selection.check_all_if_current(pending_token, ["r0".into(), "r1".into()]));
-        assert_eq!(
-            selection.count(),
-            0,
-            "late select-all cannot restore checked ids"
-        );
-        assert!(selection.active(), "multi-select mode can remain open");
-        assert_eq!(
-            controller.selected().map(|id| &**id),
-            Some("r0"),
-            "cursor selection is independent"
-        );
-    }
-
-    #[test]
     fn cleanup_and_import_reset_the_selection() {
         let mut controller = ListController::new();
         controller.hover(&"r1".into());
@@ -619,6 +556,40 @@ mod tests {
             }
         );
         assert!(controller.selected().is_none());
+    }
+
+    /// 识别进展只刷新带关键词、可能含图片的结果，而且不清掉当前选中。
+    #[test]
+    fn image_text_progress_refreshes_only_image_searches() {
+        let mut controller = ListController::new();
+        controller.hover(&"r1".into());
+        assert_eq!(
+            controller.on_update(ListUpdate::ImageTextChanged, true, true),
+            UpdateAction::Ignore
+        );
+
+        controller.set_filter(ListFilter {
+            keyword: "发票".into(),
+            ..ListFilter::default()
+        });
+        controller.hover(&"r1".into());
+        assert_eq!(
+            controller.on_update(ListUpdate::ImageTextChanged, true, true),
+            UpdateAction::ReloadNow {
+                reset_selection: false
+            }
+        );
+        assert_eq!(controller.selected().map(|id| &**id), Some("r1"));
+
+        controller.set_filter(ListFilter {
+            keyword: "发票".into(),
+            category: Some(ItemKind::Text),
+            ..ListFilter::default()
+        });
+        assert_eq!(
+            controller.on_update(ListUpdate::ImageTextChanged, true, true),
+            UpdateAction::Ignore
+        );
     }
 
     #[test]
@@ -648,28 +619,5 @@ mod tests {
         controller.on_shown();
 
         assert!(controller.selected().is_none());
-    }
-
-    #[test]
-    fn image_ocr_change_refreshes_filtered_visible_and_hidden_lists_immediately() {
-        for (visible, at_top) in [(true, false), (true, true), (false, false)] {
-            let mut controller = ListController::new();
-            let filter = ListFilter {
-                range: crate::clipboard::model::filter::Range::Favorite,
-                category: Some(ItemKind::Image),
-                ..ListFilter::default()
-            };
-            controller.set_filter(filter.clone());
-            controller.hover(&"image-1".into());
-            assert_eq!(
-                controller.on_update(ListUpdate::SearchIndexChanged, visible, at_top),
-                UpdateAction::ReloadNow {
-                    reset_selection: true
-                }
-            );
-            assert_eq!(controller.filter(), &filter);
-            assert_eq!(controller.selected().map(|id| &**id), Some("image-1"));
-            assert!(!controller.has_pending_reload());
-        }
     }
 }

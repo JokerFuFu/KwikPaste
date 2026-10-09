@@ -2,16 +2,15 @@
 // Sizes are reported in MiB (1024 × 1024 bytes), the unit the budget is written in.
 
 export const MIB = 1024 * 1024;
-// Provisional offline-OCR budget; verify against real x64/ARM64 release artifacts.
-export const SETUP_WARN_BYTES = 14 * MIB;
-export const SETUP_MAX_BYTES = 16 * MIB;
+export const SETUP_WARN_BYTES = 5.5 * MIB;
+export const SETUP_MAX_BYTES = 6 * MIB;
 
 export const formatMiB = (bytes) => {
   return `${(bytes / MIB).toFixed(2)} MiB`;
 };
 
 /**
- * Checks one installer against the budget: a problem above 16 MiB, a warning above 14 MiB.
+ * Checks one installer against the budget: a problem above 6 MiB, a warning above 5.5 MiB.
  */
 export const checkSetupSize = (name, size) => {
   const line = `${name} is ${formatMiB(size)} (${size} bytes)`;

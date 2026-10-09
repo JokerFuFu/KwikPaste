@@ -12,6 +12,14 @@ pub fn label(key: Key) -> &'static str {
         }
         Key::BackupPartialOverwrite => "这个备份只包含部分记录，请用合并导入",
 
+        Key::PasteBusy => "上一次粘贴或复制尚未结束，请稍后再试；本次未写入剪贴板",
+        Key::PasteHandoffFailed => {
+            "内容已复制到剪贴板；目标窗口或键盘交接未就绪，自动粘贴未完成，请手动粘贴"
+        }
+        Key::PastePermissionMissing => {
+            "未获得辅助功能权限，内容已复制到剪贴板，请手动粘贴；请在系统设置的辅助功能中允许快贴"
+        }
+
         Key::DragSourceFilesMissing => "拖拽源文件已不存在",
         Key::DragImageMissing => "图片文件已不存在",
         Key::DragTextEmpty => "文本内容为空",
@@ -20,6 +28,10 @@ pub fn label(key: Key) -> &'static str {
         Key::SplitTextOnly => "只有文本记录可以拆词",
         Key::SplitSensitiveRedacted => "敏感内容已脱敏显示，不能拆词",
         Key::PortableStorageFixed => "便携版的数据固定保存在程序文件夹的 data 目录里",
+        Key::StorageInsufficientSpace => "目标磁盘的可用空间不足，无法迁移数据",
+        Key::StorageSpaceUnavailable => "无法读取目标磁盘的可用空间，请检查目录权限或连接状态",
+        Key::StorageTargetHasData => "目标目录里已有快贴数据",
+        Key::StorageCustomUnavailable => "自定义数据目录当前不可用，请重新连接后重启快贴再更改目录",
         Key::SyncNotRunning => "请先开启局域网同步",
         Key::SyncInvalidCode => "配对码是 6 位数字",
         Key::SyncWrongCode => "配对码不正确",

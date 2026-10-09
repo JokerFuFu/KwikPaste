@@ -6,7 +6,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rems, size,
 };
 use kwikpaste_core::{
-    CoreEvent, app_ids,
+    CoreEvent, StorageLocation, app_ids,
     backup::{self, BackupContainerMode, BackupExportMode, BackupImportStrategy, BackupScope},
     db::overview::{ClearScope, ContentCategory},
     ops::{PreferenceDirectory, StorageOverview},
@@ -17,13 +17,21 @@ use kwikpaste_core::{
 };
 use kwikpaste_ui::{
     Button, Checkbox, ConfirmSpec, DialogSpec, Icon, IconName, Input, KpStyled as _, NumberInput,
-    NumberInputState, ScrollArea, Select, SelectOption, SelectState, Switch, TextInput,
-    form_dialog,
+    NumberInputState, ScrollArea, Select, SelectOption, SelectState, Slider, SliderState, Switch,
+    TextInput, form_dialog,
     theme::{self, SemanticTokens, TextSize, px_rems, space},
     toast::{self, Toast},
 };
 use serde_json::json;
-use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    path::PathBuf,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use super::{
     icons::PrefIcon,
@@ -43,14 +51,13 @@ use crate::{
     platform::{core_events, hotkey},
 };
 
-mod image_ocr;
+mod image_text;
 mod overview;
 
 const WINDOW_MIN_SIZE: gpui::Size<gpui::Pixels> = size(px(960.), px(600.));
 
 struct PreferencesWindow {
     handle: AnyWindowHandle,
-    view: WeakEntity<Preferences>,
 }
 
 impl Global for PreferencesWindow {}
@@ -94,15 +101,14 @@ fn initial_tab() -> TabId {
     }
 }
 
+static STORAGE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+
 pub(super) fn open(cx: &mut App) -> anyhow::Result<()> {
-    if let Some((handle, view)) = cx
+    if let Some(handle) = cx
         .try_global::<PreferencesWindow>()
-        .map(|window| (window.handle, window.view.clone()))
+        .map(|window| window.handle)
     {
-        let _ = handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |this, cx| this.refresh_image_ocr(cx));
-            bring_window_to_front(window);
-        });
+        let _ = handle.update(cx, |_, window, _| bring_window_to_front(window));
         return Ok(());
     }
     let options = WindowOptions {
@@ -115,21 +121,31 @@ pub(super) fn open(cx: &mut App) -> anyhow::Result<()> {
         focus: false,
         ..Default::default()
     };
-    let (handle, view) = crate::platform::open_window(options, cx, |window, cx| {
+    let (handle, _) = crate::platform::open_window(options, cx, |window, cx| {
         let view = cx.new(|cx| Preferences::new(window, cx));
         view.update(cx, |this, cx| {
             this.refresh_storage_overview(cx);
-            this.refresh_image_ocr(cx);
+            this.refresh_image_text(cx);
         });
+        if view
+            .read(cx)
+            .storage_location
+            .as_ref()
+            .is_some_and(|location| location.unavailable_custom_path.is_some())
+            && !STORAGE_WARNING_SHOWN.swap(true, Ordering::Relaxed)
+        {
+            toast::show(
+                Toast::warning(i18n::t("preferences:storageLocation.unavailableToast")),
+                window,
+                cx,
+            );
+        }
         crate::platform::reveal_after_first_frame(window, cx, |window, _| {
             bring_window_to_front(window);
         });
         view
     })?;
-    cx.set_global(PreferencesWindow {
-        handle,
-        view: view.downgrade(),
-    });
+    cx.set_global(PreferencesWindow { handle });
     let window_id = handle.window_id();
     cx.on_window_closed(move |cx, closed_id| {
         if closed_id == window_id {
@@ -151,11 +167,11 @@ pub(super) fn open_import(path: PathBuf, cx: &mut App) -> anyhow::Result<()> {
         focus: false,
         ..Default::default()
     };
-    let (handle, view) = crate::platform::open_window(options, cx, |window, cx| {
+    let (handle, _) = crate::platform::open_window(options, cx, |window, cx| {
         let view = cx.new(|cx| Preferences::new(window, cx));
         view.update(cx, |this, cx| {
             this.refresh_storage_overview(cx);
-            this.refresh_image_ocr(cx);
+            this.refresh_image_text(cx);
         });
         crate::platform::reveal_after_first_frame(window, cx, |window, _| {
             bring_window_to_front(window);
@@ -163,10 +179,7 @@ pub(super) fn open_import(path: PathBuf, cx: &mut App) -> anyhow::Result<()> {
         Preferences::show_import_confirmation(path.clone(), window, cx);
         view
     })?;
-    cx.set_global(PreferencesWindow {
-        handle,
-        view: view.downgrade(),
-    });
+    cx.set_global(PreferencesWindow { handle });
     let window_id = handle.window_id();
     cx.on_window_closed(move |cx, closed_id| {
         if closed_id == window_id {
@@ -206,13 +219,19 @@ struct Preferences {
     language: SelectState,
     selects: std::collections::HashMap<&'static str, SelectState>,
     number_inputs: std::collections::HashMap<&'static str, NumberInputState>,
+    sliders: std::collections::HashMap<&'static str, SliderState>,
     scroll: ScrollHandle,
     focus: FocusHandle,
     recording: Option<&'static str>,
     storage_overview: Option<StorageOverview>,
-    image_ocr: image_ocr::ImageOcrViewState,
+    storage_location: Option<StorageLocation>,
+    storage_migrating: bool,
     lan_state: Option<LanSyncState>,
     lan_code_hidden: bool,
+    /// 图片文字识别的计数（采集页状态行），打开窗口和收到 `OcrChanged` 时刷新。
+    ocr_status: Option<kwikpaste_core::OcrStatus>,
+    /// 系统的识别能力；只在开着识别时探测。
+    ocr_support: Option<kwikpaste_core::OcrSupport>,
     lan_name: TextInput,
     lan_max_image: NumberInputState,
     icons: gpui::Entity<KpImageCache>,
@@ -353,8 +372,10 @@ impl Preferences {
             this.update("sync.lan.maxImageMb", json!(value), cx);
         });
         let portable = core_host::core(cx).is_some_and(|core| core.paths().is_portable());
+        let storage_location = core_host::core(cx).and_then(|core| core.storage_location().ok());
         let mut selects = std::collections::HashMap::new();
         let mut number_inputs = std::collections::HashMap::new();
+        let mut sliders = std::collections::HashMap::new();
         let mut setting_subscriptions = Vec::new();
         let settings_json = values::to_json(&settings);
         for tab in schema::tabs(portable) {
@@ -434,6 +455,23 @@ impl Preferences {
                             });
                             setting_subscriptions.push(subscription);
                             selects.insert(setting.id, state);
+                        }
+                        Control::Slider { min, max } => {
+                            let value = values::get_u64(&settings_json, setting.path.unwrap_or(""))
+                                .clamp(u64::from(min), u64::from(max))
+                                as u8;
+                            let state = SliderState::new(value, min, max, cx);
+                            let path = setting.path;
+                            setting_subscriptions.push(state.on_change(cx, |_, cx| cx.notify()));
+                            setting_subscriptions.push(state.on_commit(
+                                cx,
+                                move |this, value, cx| {
+                                    if let Some(path) = path {
+                                        this.update(path, json!(value), cx);
+                                    }
+                                },
+                            ));
+                            sliders.insert(setting.id, state);
                         }
                         Control::Number { min, max, .. } => {
                             let value = values::get(&settings_json, setting.path.unwrap_or(""))
@@ -524,13 +562,6 @@ impl Preferences {
         let subscriptions: Vec<Subscription> = core_events(cx)
             .map(|events| {
                 cx.subscribe(&events, |this, _, event: &CoreEvent, cx| {
-                    if let CoreEvent::SettingsUpdated { settings, .. } = event {
-                        this.settings = (**settings).clone();
-                        cx.notify();
-                    }
-                    if image_ocr::refresh_for_event(event) {
-                        this.refresh_image_ocr(cx);
-                    }
                     if matches!(
                         event,
                         CoreEvent::LanSyncChanged | CoreEvent::LanDevicePaired { .. }
@@ -539,7 +570,24 @@ impl Preferences {
                         this.lan_state = Some(core.lan_sync_state());
                         cx.notify();
                     }
+                    // 识别进度和开关变化：采集页的状态行跟着刷新。
+                    if this.tab == TabId::Capture
+                        && (matches!(event, CoreEvent::OcrChanged)
+                            || matches!(
+                                event,
+                                CoreEvent::SettingsUpdated { delta, .. }
+                                    if delta.touches("clipboard.ocr")
+                            ))
+                    {
+                        this.refresh_image_text(cx);
+                    }
                     // 停在数据概览页时，新采集、清理和分组变化都实时反映到统计上。
+                    if matches!(event, CoreEvent::ClipboardReloaded) {
+                        this.storage_location =
+                            core_host::core(cx).and_then(|core| core.storage_location().ok());
+                        this.icons.update(cx, |icons, cx| icons.clear(None, cx));
+                        cx.notify();
+                    }
                     if this.tab == TabId::Overview
                         && matches!(
                             event,
@@ -578,13 +626,17 @@ impl Preferences {
             language,
             selects,
             number_inputs,
+            sliders,
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             recording: None,
             storage_overview: None,
-            image_ocr: image_ocr::ImageOcrViewState::default(),
+            storage_location,
+            storage_migrating: false,
             lan_state,
             lan_code_hidden: false,
+            ocr_status: None,
+            ocr_support: None,
             lan_name,
             lan_max_image,
             icons,
@@ -970,6 +1022,207 @@ impl Preferences {
             .detach();
     }
 
+    /// 数据目录行右侧的打开 / 更改 / 还原；迁移中或自定义目录不可用时只能打开。
+    fn render_storage_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let location = self.storage_location.as_ref();
+        let fallback = location.and_then(|location| location.unavailable_custom_path.as_deref());
+        let disabled = self.storage_migrating || fallback.is_some();
+        let portable = core_host::core(cx).is_some_and(|core| core.paths().is_portable());
+        let open = Button::new("storage-open", i18n::t("preferences:storageLocation.open"))
+            .disabled(self.storage_migrating)
+            .on_click(
+                cx.listener(|this, _, _, cx| this.open_directory(PreferenceDirectory::Data, cx)),
+            );
+        let change = Button::new(
+            "storage-change",
+            i18n::t("preferences:storageLocation.change"),
+        )
+        .disabled(disabled)
+        .loading(self.storage_migrating)
+        .on_click(cx.listener(|this, _, window, cx| this.change_storage_directory(window, cx)));
+        let reset = Button::new(
+            "storage-reset",
+            i18n::t("preferences:storageLocation.reset"),
+        )
+        .disabled(disabled || !location.is_some_and(|location| location.is_custom))
+        .on_click(cx.listener(|this, _, window, cx| this.reset_storage_directory(window, cx)));
+        let mut actions = div().flex().items_center().gap(space(2.)).child(open);
+        if !portable {
+            actions = actions.child(change);
+        }
+        if !portable
+            && location.is_some_and(|location| {
+                location.is_custom || location.unavailable_custom_path.is_some()
+            })
+        {
+            actions = actions.child(reset);
+        }
+        actions.into_any_element()
+    }
+
+    fn change_storage_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.storage_migrating
+            || self
+                .storage_location
+                .as_ref()
+                .is_some_and(|location| location.unavailable_custom_path.is_some())
+        {
+            return;
+        }
+        let task = crate::clipboard::view::pin::prompt_for_paths(
+            gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some(i18n::t("preferences:storageLocation.pickTitle")),
+            },
+            cx,
+        );
+        let entity = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let Some(paths) = task.await else {
+                    return;
+                };
+                let Some(parent) = paths.into_iter().next() else {
+                    return;
+                };
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    if kwikpaste_core::cloud_sync_provider(&parent).is_some() {
+                        let answer = kwikpaste_ui::confirm(
+                            ConfirmSpec::new(i18n::t(
+                                "preferences:storageLocation.cloudConfirmTitle",
+                            ))
+                            .content(i18n::t("preferences:storageLocation.cloudConfirmContent"))
+                            .ok_text(i18n::t("common:actions.continue"))
+                            .cancel_text(i18n::t("common:actions.cancel")),
+                            window,
+                            cx,
+                        );
+                        let entity = cx.entity().downgrade();
+                        window
+                            .spawn(cx, async move |cx| {
+                                if answer.await.unwrap_or(false) {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.start_storage_change(parent, cx)
+                                    });
+                                }
+                            })
+                            .detach();
+                    } else {
+                        this.start_storage_change(parent, cx);
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn start_storage_change(&mut self, parent: PathBuf, cx: &mut Context<Self>) {
+        if self.storage_migrating {
+            return;
+        }
+        let Some(core) = core_host::core(cx).cloned() else {
+            return;
+        };
+        self.storage_migrating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = core.change_storage_location(parent).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.storage_migrating = false;
+                match result {
+                    Ok(result) => {
+                        this.storage_location = Some(result.location);
+                        this.storage_overview = None;
+                        this.refresh_storage_overview(cx);
+                        toast::show(
+                            Toast::success(i18n::t("preferences:storageLocation.changed")),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("storage location switch failed: {error:#}");
+                        let message = i18n::t_args(
+                            "commands:error",
+                            &[
+                                ("label", &i18n::t("commands:labels.changeStorageLocation")),
+                                ("message", &error.to_string()),
+                            ],
+                        );
+                        toast::show(Toast::error(message), window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reset_storage_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.storage_migrating {
+            return;
+        }
+        let answer = kwikpaste_ui::confirm(
+            ConfirmSpec::new(i18n::t("preferences:storageLocation.resetConfirmTitle"))
+                .content(i18n::t("preferences:storageLocation.resetConfirmContent"))
+                .ok_text(i18n::t("preferences:storageLocation.reset"))
+                .cancel_text(i18n::t("common:actions.cancel")),
+            window,
+            cx,
+        );
+        let entity = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                if answer.await.unwrap_or(false) {
+                    let _ = entity.update(cx, |this, cx| this.start_storage_reset(cx));
+                }
+            })
+            .detach();
+    }
+
+    fn start_storage_reset(&mut self, cx: &mut Context<Self>) {
+        if self.storage_migrating {
+            return;
+        }
+        let Some(core) = core_host::core(cx).cloned() else {
+            return;
+        };
+        self.storage_migrating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = core.reset_storage_location().await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.storage_migrating = false;
+                match result {
+                    Ok(result) => {
+                        this.storage_location = Some(result.location);
+                        this.storage_overview = None;
+                        this.refresh_storage_overview(cx);
+                        toast::show(
+                            Toast::success(i18n::t("preferences:storageLocation.restored")),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("storage location switch failed: {error:#}");
+                        let message = i18n::t_args(
+                            "commands:error",
+                            &[
+                                ("label", &i18n::t("commands:labels.resetStorageLocation")),
+                                ("message", &error.to_string()),
+                            ],
+                        );
+                        toast::show(Toast::error(message), window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_directory(&self, target: PreferenceDirectory, cx: &mut Context<Self>) {
         let Some(core) = core_host::core(cx) else {
             return;
@@ -1009,6 +1262,7 @@ impl Preferences {
                     return;
                 };
                 entity.update(cx, |this, cx| match id {
+                    "copy.sound.preview" => this.preview_copy_sound(cx),
                     "backup.export" => this.open_export(ExportKind::Backup, window, cx),
                     "backup.importHistory" => this.import_backup(window, cx),
                     "localData.cleanCache" => this.clean_resource_cache(cx),
@@ -1037,6 +1291,17 @@ impl Preferences {
                 });
             })
             .into_any_element()
+    }
+
+    /// 试听取滑块当前值，不等待异步落盘；平台层在工作线程播放，不阻塞偏好窗。
+    fn preview_copy_sound(&self, cx: &App) {
+        let volume_percent = self.sliders.get("copy.sound.volume").map_or(
+            self.settings.clipboard.feedback.copy_sound_volume.min(100),
+            |state| state.value(cx),
+        );
+        if let Some(core) = core_host::core(cx) {
+            core.play_copy_sound(volume_percent);
+        }
     }
 
     /// 拖放按当前位置移入目标行；未启用的格式仍保留在顺序中，避免开关采集类型时丢失位置。
@@ -2384,7 +2649,7 @@ impl Preferences {
                             this.refresh_storage_overview(cx);
                         }
                         if id == TabId::Capture {
-                            this.refresh_image_ocr(cx);
+                            this.refresh_image_text(cx);
                         }
                         cx.notify();
                     })),
@@ -2486,6 +2751,9 @@ impl Preferences {
         if setting.is_collapsed(&self.settings) {
             return false;
         }
+        if setting.id == "ocr.status" && !self.image_text_row_visible() {
+            return false;
+        }
         let query = self.search.value(cx);
         if query.is_empty() {
             return true;
@@ -2505,7 +2773,51 @@ impl Preferences {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        if setting.id == "ocr.status" {
+            return self.render_image_text_status(first, cx);
+        }
         let title = text::setting_title(setting);
+        if setting.id == "localData.dataDirectory" {
+            let tokens = theme::semantic(cx);
+            let location = self.storage_location.as_ref();
+            let description = match location {
+                _ if self.storage_migrating => {
+                    i18n::t("preferences:storageLocation.migrating").to_string()
+                }
+                Some(location) if location.is_custom => format!(
+                    "{} · {}",
+                    i18n::t("preferences:storageLocation.custom"),
+                    location.current_path
+                ),
+                Some(location) => location.current_path.clone(),
+                None => text::setting_description(setting).to_string(),
+            };
+            let warning = location
+                .and_then(|location| location.unavailable_custom_path.as_deref())
+                .map(|path| {
+                    div()
+                        .kp_text(TextSize::Xs)
+                        .text_color(tokens.status.warning.solid)
+                        .child(i18n::t_args(
+                            "preferences:storageLocation.unavailable",
+                            &[("path", path)],
+                        ))
+                });
+            return row_frame(first, tokens)
+                .child(
+                    row_label(title, description.into(), tokens)
+                        .when_some(warning, |label, warning| label.child(warning)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_end()
+                        .child(self.render_storage_actions(cx)),
+                )
+                .into_any_element();
+        }
         let description = text::setting_description(setting);
         let path = setting.path;
         let settings_json = values::to_json(&self.settings);
@@ -2541,6 +2853,29 @@ impl Preferences {
                         .width(CONTROL_WIDTH)
                         .disabled(setting.is_disabled(&self.settings))
                         .accessibility_label(title.clone())
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            }
+            Control::Slider { .. } => {
+                if let Some(state) = self.sliders.get(setting.id) {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(space(3.))
+                        .child(
+                            Slider::new(state)
+                                .width(CONTROL_WIDTH)
+                                .disabled(setting.is_disabled(&self.settings))
+                                .accessibility_label(title.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(rems(3.))
+                                .text_right()
+                                .child(format!("{}%", state.value(cx))),
+                        )
                         .into_any_element()
                 } else {
                     div().into_any_element()
@@ -2610,7 +2945,6 @@ impl Preferences {
             })
             .into_any_element(),
             Control::StorageOverview => self.render_storage_overview(window, cx),
-            Control::ImageOcr => self.render_image_ocr(cx),
             Control::CaptureKinds => self.render_capture_kinds(value, cx),
             Control::CaptureOrder => self.render_capture_order(cx),
             Control::Retention => self.render_retention(cx),

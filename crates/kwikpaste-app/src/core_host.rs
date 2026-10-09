@@ -65,14 +65,6 @@ pub fn start() -> anyhow::Result<StartedCore> {
     ))
     .context("kwikpaste-core did not start")?;
     core.set_platform_services(Arc::new(NativeServices));
-    // Windows 的离线模型在开始采集前校验并初始化，数据目录用于保存随附许可说明。
-    let ocr_configuration = core
-        .paths()
-        .app_data_dir()
-        .and_then(|data_dir| core.configure_image_ocr_models(&data_dir.join("ocr-components")));
-    if let Err(error) = ocr_configuration {
-        log::warn!("offline image OCR is unavailable: {error:#}");
-    }
     // 自测进程不读写本机剪贴板，也不监听；只有真机剪贴板探针（`--selftest-real-clipboard`）例外。
     let real_clipboard =
         !crate::selftest::active() || crate::selftest::enabled(crate::selftest::REAL_CLIPBOARD);
@@ -86,6 +78,11 @@ pub fn start() -> anyhow::Result<StartedCore> {
         }
     } else {
         core.set_clipboard_provider(Arc::new(MemoryClipboard::new()));
+    }
+    if crate::selftest::enabled(crate::selftest::OCR_DEMO)
+        && let Err(err) = seed_ocr_demo(&core)
+    {
+        log::error!("the OCR demo images could not be stored: {err:#}");
     }
     let lan_network = if crate::selftest::active() {
         LanSyncNetwork::loopback()
@@ -113,6 +110,41 @@ pub fn start() -> anyhow::Result<StartedCore> {
         },
         events,
     })
+}
+
+/// `--selftest-ocr-demo`：按采集流程存入 `KP_OCR_DEMO_DIR` 下的 PNG（重复内容会去重），再按
+/// `KP_OCR_DEMO_MODE` 开关识别。
+fn seed_ocr_demo(core: &Core) -> anyhow::Result<()> {
+    use kwikpaste_core::clipboard::{ClipboardPayload, ImagePayload};
+
+    let dir = std::env::var_os("KP_OCR_DEMO_DIR").context("KP_OCR_DEMO_DIR is not set")?;
+    let mut paths: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let bytes = std::fs::read(&path)?;
+        let (width, height) = image::image_dimensions(&path)?;
+        let payload = ClipboardPayload::Image(ImagePayload {
+            bytes,
+            width,
+            height,
+        });
+        if let Some(item) = core.build_item(&payload)? {
+            futures::executor::block_on(core.store_item(item, None))?;
+        }
+    }
+    // `KP_OCR_DEMO_MODE=off` 关掉识别；`fresh` 先清掉识别结果再开启，内存对比时让每次都真的识别一遍。
+    let mode = std::env::var("KP_OCR_DEMO_MODE").unwrap_or_default();
+    if mode == "fresh" {
+        futures::executor::block_on(core.clear_ocr_data())?;
+    }
+    let enabled = mode != "off";
+    futures::executor::block_on(
+        core.update_settings(serde_json::json!({ "clipboard": { "ocr": { "enabled": enabled } } })),
+    )?;
+    Ok(())
 }
 
 impl CoreHost {

@@ -33,6 +33,8 @@ impl EventSink for NoopSink {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
+    /// 图片文字识别状态变化，运行中进度最多每秒两次。
+    OcrChanged,
     /// 一条记录入库或命中已有内容（1.x `clipboard://updated` 的 `{ id, kind, deduplicated }`）。
     ClipboardUpserted {
         id: String,
@@ -51,8 +53,6 @@ pub enum CoreEvent {
     CleanupStatus(CleanupStatus),
     /// 自定义分组增删改或排序变了（1.x `clipboard-groups://updated`），分组栏需要重新拉取。
     GroupsUpdated,
-    /// OCR queue or derived search data changed; refetch status and the filtered list.
-    ImageOcrChanged,
     /// 历史数据整体换了一份：切换存储位置、导入备份（1.x `clipboard://updated` 的 `{ imported: true }`）。
     /// 列表、分组栏、来源应用都要重新拉取。
     ClipboardReloaded,

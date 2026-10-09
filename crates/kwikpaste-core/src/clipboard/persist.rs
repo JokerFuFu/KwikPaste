@@ -36,8 +36,10 @@ pub(crate) async fn persist_and_notify(
         }
     };
     crate::sync::on_local_capture(core, &item_to_write, seq);
-    if core.settings.snapshot().clipboard.feedback.copy_sound {
-        core.platform().play_copy_sound();
+    let feedback = core.settings.snapshot().clipboard.feedback;
+    if feedback.copy_sound {
+        core.platform()
+            .play_copy_sound(feedback.copy_sound_volume.min(100));
     }
     Ok(result)
 }
@@ -50,16 +52,15 @@ pub(crate) async fn store_and_emit(core: &CoreInner, item: &ClipboardItem) -> Re
     let result = {
         let _serial = core.upsert_lock.lock().await;
         let pool = core.db.pool().await;
-        let result = upsert_item(&pool, item).await?;
-        if item.kind == crate::db::models::ClipboardKind::Image {
-            if let Err(err) = crate::ocr::on_capture(core, &pool, &result.id).await {
-                log::warn!("image OCR enqueue failed: {err}");
-            }
-        }
-        result
+        upsert_item(&pool, item).await?
     };
     if !result.deduplicated {
         super::cleanup::notify_inserted(core);
+        if item.kind == crate::db::models::ClipboardKind::Image
+            && core.settings.snapshot().clipboard.ocr.enabled
+        {
+            core.ocr.nudge();
+        }
     }
 
     core.events.emit(CoreEvent::ClipboardUpserted {

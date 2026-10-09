@@ -65,7 +65,6 @@ brew install --cask mansandadada/tap/kwikpaste
 
 - 采集纯文本、HTML、RTF、图片、文件和文件夹等剪贴板内容。
 - 使用 SQLite FTS5 搜索剪贴板正文与备注。
-- 可选的离线图片 OCR 搜索：macOS 使用 Apple Vision，Windows 随包提供 Tesseract 中英文引擎与模型。默认关闭，可在「偏好设置 › 数据 › 图片文字识别」中开启、补识别历史图片、暂停或清除识别索引；清除索引不会删除原图或历史记录。
 - 按来源应用和内容类型过滤历史记录。
 - 识别并跳过高置信敏感内容，例如私钥、服务 Token、AWS Key 和 JWT。
 - 在独立预览窗口中查看文本、图片和文件记录。

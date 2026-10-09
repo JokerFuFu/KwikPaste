@@ -7,7 +7,7 @@ name: Native Release
 #                      上传到草稿 release → 在 runner 上实装、检查、卸载 → 生成 latest-v2.json 上传到草稿。
 #                      负责人检查草稿后手动发布；发布后由 channel-pointer-v2.yml 镜像到七牛
 #                      kwikpaste/v2/stable/latest.json（2.x 唯一的更新渠道），GitHub 兜底是 channel-v2-stable 里的 latest-v2.json。
-#   workflow_dispatch / Native CI 的手动 workflow_call  干跑：同样构建、打包、断言、实装测试、生成清单，只是用 prepare 里临时生成的一次性密钥签名；
+#   workflow_dispatch  干跑：同样构建、打包、断言、实装测试、生成清单，只是用 prepare 里临时生成的一次性密钥签名；
 #                      不建 release、不读任何 secrets，产物留在 artifact 里（保留 7 天）。
 #
 # 2.x 的 GitHub release 里永远没有名为 latest.json 的资产：老客户端的备用地址是 releases/latest/download/latest.json。
@@ -19,11 +19,9 @@ name: Native Release
     tags:
       - "v2.*"
   workflow_dispatch:
-  workflow_call:
 
 permissions:
-  # Publishing steps use the explicit RELEASE_TOKEN; builds and dry runs only read source.
-  contents: read
+  contents: write
 
 concurrency:
   group: native-release-${{ github.ref_name }}
@@ -263,18 +261,6 @@ jobs:
           "GPUI_FXC_PATH=$fxc" >> $env:GITHUB_ENV
 
       # 正式身份只在这里打开。静态 CRT 只经 --target 的 rustflags 生效（build.rs 缺了会直接失败）。
-      - name: Native OCR dependency cache
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/kwikpaste-windows-ocr
-          key: ocr-deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/prepare-windows-ocr.ps1') }}
-
-      - name: Prepare bundled offline Windows OCR
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/prepare-windows-ocr.ps1 -Architecture ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'arm64' || 'x64' }}
-
       - name: Build
         shell: bash
         env:

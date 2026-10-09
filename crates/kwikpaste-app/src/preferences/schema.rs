@@ -107,6 +107,10 @@ pub enum Control {
         max: u64,
         suffix: Option<&'static str>,
     },
+    Slider {
+        min: u8,
+        max: u8,
+    },
     Tiles(TilesKind),
     /// 要记录的内容类型：一组复选框，提交时展开成 `capture.<kind>` 五个开关。
     CaptureKinds,
@@ -133,8 +137,8 @@ pub enum Control {
     StorageOverview,
     /// 局域网同步的设备、配对与连接控制面板。
     LanSync,
-    /// 图片文字索引的开关、队列状态与管理操作。
-    ImageOcr,
+    /// 图片文字识别的进度、结果和系统能力（开关下面的一行，按状态换标题和按钮）。
+    ImageTextStatus,
     ShortcutRecorder,
 }
 
@@ -144,11 +148,7 @@ impl Control {
     pub fn full_width(self) -> bool {
         matches!(
             self,
-            Self::CaptureKinds
-                | Self::CaptureOrder
-                | Self::RetentionRules
-                | Self::LanSync
-                | Self::ImageOcr
+            Self::CaptureKinds | Self::CaptureOrder | Self::RetentionRules | Self::LanSync
         )
     }
 }
@@ -672,9 +672,22 @@ fn capture_sections() -> Vec<Section> {
                 )
                 .path("clipboard.capture.maxImageMb")
                 .keywords(&["image", "picture", "size", "limit", "mb"]),
-                Setting::new("copy.sound", Control::Switch)
-                    .path("clipboard.feedback.copySound")
-                    .keywords(&["sound", "feedback", "copy"]),
+            ],
+        },
+        Section {
+            id: "imageText",
+            settings: vec![
+                Setting::new("ocr.enabled", Control::Switch)
+                    .path("clipboard.ocr.enabled")
+                    .keywords(&["ocr", "image", "picture", "text", "recognize", "search"]),
+                Setting::new("ocr.status", Control::ImageTextStatus).keywords(&[
+                    "ocr",
+                    "image",
+                    "text",
+                    "recognize",
+                    "progress",
+                    "language",
+                ]),
             ],
         },
         Section {
@@ -807,6 +820,25 @@ fn paste_sections() -> Vec<Section> {
                     .keywords(&["copy", "plain", "format"]),
             ],
         },
+        Section {
+            id: "sound",
+            settings: vec![
+                Setting::new("copy.sound", Control::Switch)
+                    .path("clipboard.feedback.copySound")
+                    .keywords(&["sound", "feedback", "copy", "音效", "提示音", "声音"]),
+                Setting::new("copy.sound.volume", Control::Slider { min: 0, max: 100 })
+                    .path("clipboard.feedback.copySoundVolume")
+                    .keywords(&["音量", "音效", "试听", "volume", "sound", "preview"])
+                    .child_of("copy.sound", |settings| {
+                        !settings.clipboard.feedback.copy_sound
+                    }),
+                Setting::new("copy.sound.preview", Control::Action { danger: false })
+                    .keywords(&["音量", "音效", "试听", "volume", "sound", "preview"])
+                    .child_of("copy.sound", |settings| {
+                        !settings.clipboard.feedback.copy_sound
+                    }),
+            ],
+        },
     ]
 }
 
@@ -870,23 +902,6 @@ fn item_sections() -> Vec<Section> {
 
 fn data_sections() -> Vec<Section> {
     vec![
-        Section {
-            id: "imageOcr",
-            settings: vec![
-                Setting::new("ocr.imageRecognition", Control::ImageOcr).keywords(&[
-                    "ocr",
-                    "image",
-                    "recognition",
-                    "search",
-                    "offline",
-                    "index",
-                    "图片",
-                    "文字",
-                    "识别",
-                    "搜索",
-                ]),
-            ],
-        },
         Section {
             id: "cleanup",
             settings: vec![
@@ -1069,67 +1084,62 @@ mod tests {
     }
 
     #[test]
-    fn image_ocr_controls_remain_visible_when_disabled() {
-        let settings = Settings::default();
-        let tabs = tabs(false);
-        let data = tabs
+    fn copy_sound_rows_live_on_paste_after_format_and_collapse_with_the_switch() {
+        assert!(
+            capture_sections()
+                .iter()
+                .flat_map(|section| &section.settings)
+                .all(|setting| !setting.id.starts_with("copy.sound"))
+        );
+        let sections = paste_sections();
+        let sound_index = sections
             .iter()
-            .find(|tab| tab.id == TabId::Data)
-            .expect("data tab");
-        let panel = data
-            .sections
-            .iter()
-            .flat_map(|section| &section.settings)
-            .find(|setting| setting.id == "ocr.imageRecognition")
-            .expect("image OCR panel");
-        assert!(panel.control.full_width());
-        assert!(!panel.is_collapsed(&settings));
-        assert!(!settings.clipboard.ocr.enabled);
-    }
-
-    #[test]
-    fn image_ocr_locales_cover_controls_counts_and_preservation_confirmation() {
-        for source in [
-            include_str!("../../locales/zh-CN/preferences.json"),
-            include_str!("../../locales/en-US/preferences.json"),
-        ] {
-            let locale: Value = serde_json::from_str(source).expect("preference locale JSON");
-            for key in [
-                "enable",
-                "pause",
-                "resume",
-                "indexHistory",
-                "clear",
-                "counts",
-                "ready",
-                "unavailable",
-                "statusUnavailable",
-                "loading",
-                "disabled",
-                "paused",
-                "running",
-                "idle",
-                "clearTitle",
-                "clearContent",
-                "cleared",
-                "error",
-            ] {
-                assert!(
-                    locale["imageOcr"][key]
-                        .as_str()
-                        .is_some_and(|value| !value.is_empty()),
-                    "missing imageOcr.{key}"
-                );
-            }
-            for count in ["total", "pending", "completed", "failed"] {
-                assert!(
-                    locale["imageOcr"]["counts"]
-                        .as_str()
-                        .expect("counts")
-                        .contains(&format!("{{{{{count}}}}}"))
-                );
-            }
-            assert!(locale["schema"]["settings"]["ocr"]["imageRecognition"]["title"].is_string());
+            .position(|section| section.id == "sound")
+            .unwrap();
+        assert_eq!(sections[sound_index - 1].id, "format");
+        let sound = &sections[sound_index];
+        assert_eq!(
+            sound
+                .settings
+                .iter()
+                .map(|setting| setting.id)
+                .collect::<Vec<_>>(),
+            ["copy.sound", "copy.sound.volume", "copy.sound.preview"]
+        );
+        assert_eq!(
+            sound.settings[1].path,
+            Some("clipboard.feedback.copySoundVolume")
+        );
+        assert!(matches!(
+            sound.settings[1].control,
+            Control::Slider { min: 0, max: 100 }
+        ));
+        let mut settings = Settings::default();
+        assert!(!sound.settings[0].is_collapsed(&settings));
+        for row in &sound.settings[1..] {
+            assert_eq!(row.parent, Some("copy.sound"));
+            assert!(row.is_collapsed(&settings));
+        }
+        settings.clipboard.feedback.copy_sound = true;
+        assert!(
+            sound
+                .settings
+                .iter()
+                .all(|row| !row.is_collapsed(&settings))
+        );
+        for keyword in ["音效", "提示音", "声音"] {
+            assert!(super::super::view::search_matches(
+                keyword,
+                "",
+                sound.settings[0].keywords
+            ));
+        }
+        for keyword in ["音量", "音效", "试听", "volume", "sound", "preview"] {
+            assert!(super::super::view::search_matches(
+                keyword,
+                "",
+                sound.settings[1].keywords
+            ));
         }
     }
 }

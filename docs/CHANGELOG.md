@@ -1,13 +1,16 @@
 # Changelog
 
-## Unreleased
-
-- Add opt-in offline image OCR search using Apple Vision on macOS and bundled Tesseract English/Simplified Chinese models on Windows.
-- Manage pause/resume, historical backfill and retries, progress, and derived-index clearing from Preferences › Data. Original images, records, favorites, notes, and groups are preserved.
-- Adopt existing migrated OCR tables as well as clean databases; OCR matches respect the existing history filters.
-- Clear obsolete bulk selection after OCR matches disappear and reject stale select-all results.
-
 All notable changes to KwikPaste are documented here.
+
+## 2.0.1 - 2026-10-09
+
+- Added Change data directory in Preference › Data. You can move your records, images and settings to another folder, and restore the default location later.
+- The update window now shows a short summary of what changed in the new version.
+- Lower memory use: closed windows now release their graphics memory, the clipboard window drops its thumbnails and hidden preview text when it hides, and app and file icons are decoded at display size and loaded with less overhead on Windows.
+- Fixed KwikPaste swallowing keys that are not bound to any panel shortcut while the clipboard window is open. Plain Delete now deletes the selected record.
+- Fixed the tray menu on Windows not following the system dark mode.
+- Fixed the clipboard window's Mica frame going flat after it was activated for editing on Windows.
+- Fixed unreadable text on some macOS windows, the permission buttons not opening the matching privacy pane, and a double-click on the top edge of the clipboard window zooming it.
 
 ## 2.0.0 - 2026-10-08
 

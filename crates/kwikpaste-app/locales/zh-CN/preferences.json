@@ -79,25 +79,50 @@
     "shortcutInUse": "已被其他程序占用",
     "shortcutNotSet": "未设置"
   },
-  "imageOcr": {
-    "clear": "清除文字索引",
-    "clearContent": "仅清除识别出的文字和待处理队列，并暂停识别。原始图片、剪贴板历史、收藏、备注及分组均保留。需要时可重新索引历史图片。",
-    "clearTitle": "清除图片文字索引？",
-    "cleared": "文字索引已清除，识别已暂停。原始图片和历史记录已保留。",
-    "counts": "图片 {{total}} · 待处理 {{pending}} · 已完成 {{completed}} · 失败 {{failed}}",
-    "disabled": "已关闭文字搜索",
-    "enable": "启用离线图片文字搜索",
-    "error": "图片文字识别：{{message}}",
-    "idle": "识别队列空闲",
-    "indexHistory": "索引历史图片 / 重试失败项",
-    "loading": "正在读取识别状态…",
-    "pause": "暂停识别",
-    "paused": "识别已暂停，已完成结果仍可搜索",
-    "ready": "离线引擎已就绪",
-    "resume": "继续识别",
-    "running": "正在处理图片",
-    "statusUnavailable": "无法读取识别状态",
-    "unavailable": "离线引擎不可用"
+  "imageText": {
+    "checking": "正在检查系统的文字识别能力…",
+    "deleted": "已删除识别文字",
+    "deleteFailed": "删除识别文字",
+    "done": {
+      "title": "{{count}} 张图片已全部识别"
+    },
+    "empty": {
+      "description": "复制的图片会自动识别。",
+      "title": "还没有图片"
+    },
+    "failed": "{{count}} 张无法识别",
+    "language": "识别语言：{{languages}}",
+    "languageSeparator": "、",
+    "languages": {
+      "en": "英文",
+      "ja": "日文",
+      "ko": "韩文",
+      "zh-Hans": "中文（简体）",
+      "zh-Hant": "中文（繁体）"
+    },
+    "missingLanguage": {
+      "action": "打开语言设置",
+      "description": "在 Windows 设置 › 时间和语言 › 语言和区域 里，给中文或英文添加「光学字符识别」。",
+      "title": "系统缺少文字识别语言"
+    },
+    "queued": {
+      "title": "{{count}} 张图片等待识别"
+    },
+    "running": {
+      "description": "识别在单独的后台进程里进行，完成后自动退出，不增加常驻内存。",
+      "title": "正在识别 {{done}} / {{total}} 张图片"
+    },
+    "saved": {
+      "action": "删除",
+      "description": "{{count}} 张图片的识别结果还在本机，重新开启后直接可用。",
+      "title": "已保存的识别文字"
+    },
+    "unsupported": {
+      "descriptionMac": "需要 macOS 10.15 或更高版本。",
+      "descriptionWindows": "需要 Windows 10 或更高版本。",
+      "title": "当前系统不支持图片文字识别"
+    },
+    "withText": "{{count}} 张包含文字"
   },
   "lanSync": {
     "connect": {
@@ -421,7 +446,7 @@
       "globalShortcuts": {
         "title": "全局快捷键"
       },
-      "imageOcr": {
+      "imageText": {
         "title": "图片文字识别"
       },
       "lanContent": {
@@ -456,6 +481,9 @@
       },
       "sort": {
         "title": "列表排序"
+      },
+      "sound": {
+        "title": "提示音"
       },
       "startup": {
         "title": "启动与图标"
@@ -673,8 +701,15 @@
           "title": "默认复制为纯文本"
         },
         "sound": {
-          "preview": "试听提示音",
-          "title": "复制成功提示音"
+          "preview": {
+            "controlLabel": "试听",
+            "title": "试听提示音"
+          },
+          "title": "复制成功提示音",
+          "volume": {
+            "description": "拖动调整音量，松开后保存；0% 为静音。",
+            "title": "提示音音量"
+          }
         },
         "updateOnReuse": {
           "description": "复制或粘贴旧记录时，刷新它的使用时间和次数。",
@@ -745,9 +780,12 @@
         }
       },
       "ocr": {
-        "imageRecognition": {
-          "description": "在本机识别图片中的中文和英文，便于搜索。默认关闭；启用后自动处理新图片，历史图片需手动索引。",
-          "title": "图片文字搜索"
+        "enabled": {
+          "description": "开启后可以用图片里的文字搜到图片，也能直接复制图中文字。识别在本机完成，不上传。",
+          "title": "识别图片中的文字"
+        },
+        "status": {
+          "title": "识别状态"
         }
       },
       "organizing": {
@@ -1078,11 +1116,19 @@
   },
   "storageLocation": {
     "change": "更改数据目录",
+    "changed": "数据目录已更改",
+    "cloudConfirmContent": "云同步可能导致打开的数据库损坏，确定继续吗？",
+    "cloudConfirmTitle": "云同步目录风险",
+    "custom": "自定义",
+    "migrating": "正在迁移数据…",
     "open": "打开数据目录",
     "pickTitle": "选择新的数据目录位置",
     "reset": "还原默认目录",
     "resetConfirmContent": "将把当前历史数据库、设置文件和资源缓存迁回默认数据目录，并在迁移成功后删除当前自定义数据目录。",
-    "resetConfirmTitle": "还原默认数据目录"
+    "resetConfirmTitle": "还原默认数据目录",
+    "restored": "数据目录已还原",
+    "unavailable": "自定义数据目录 {{path}} 当前不可用，本次使用默认目录。重新连接后重启快贴即可恢复。",
+    "unavailableToast": "自定义数据目录当前不可用，本次使用默认目录"
   },
   "title": "快贴 偏好设置",
   "windowTitle": "偏好设置"

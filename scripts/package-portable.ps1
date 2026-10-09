@@ -28,9 +28,7 @@ param(
     [string] $Arch,
 
     [Parameter(Mandatory = $true)]
-    [string] $OutDir,
-
-    [string] $NoticePath
+    [string] $OutDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,9 +52,6 @@ $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.Zi
 try {
     [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $exe, 'KwikPaste/KwikPaste.exe', $level)
     [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $marker, 'KwikPaste/portable.txt', $level)
-    if ($NoticePath) {
-        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Resolve-Path -LiteralPath $NoticePath).Path, 'KwikPaste/OCR-NOTICES.txt', $level)
-    }
 }
 finally {
     $zip.Dispose()

@@ -209,30 +209,12 @@ const packageWindows = (cli, options, version, info, release) => {
     copyFileSync(exe, join(release, `${product}.exe`));
   }
 
-  const noticeSource = join(
-    ROOT,
-    "crates",
-    "kwikpaste-core",
-    "assets",
-    "ocr",
-    "OCR-NOTICES.txt",
-  );
-  const noticePath = join(release, "OCR-NOTICES.txt");
-  if (existsSync(noticeSource)) {
-    copyFileSync(noticeSource, noticePath);
-  }
-  if (!existsSync(noticePath)) {
-    throw new Error("Bundled OCR notices are missing; prepare Windows OCR before packaging");
-  }
-  const noticeConfig = JSON.stringify({
-    bundle: { resources: { [noticePath]: "OCR-NOTICES.txt" } },
-  });
   const produced = [];
   const setupName = `${product}_${version}_${info.arch}-setup.exe`;
   const builtSetup = join(release, "bundle", "nsis", setupName);
   const renderDir = join(release, "nsis", info.arch);
 
-  bundle(cli, options, "nsis", [noticeConfig]);
+  bundle(cli, options, "nsis", []);
   copyWithSig(builtSetup, join(options.out, setupName), options.sign);
   produced.push(setupName);
   const renderOut = join(options.out, "nsis", info.arch);
@@ -244,7 +226,6 @@ const packageWindows = (cli, options, version, info, release) => {
   if (options.osGateTest) {
     const hooks = join(ROOT, "packaging", "test-identity", "os-gate-hooks.nsh");
     bundle(cli, { ...options, sign: false }, "nsis", [
-      noticeConfig,
       JSON.stringify({
         bundle: { windows: { nsis: { installerHooks: hooks } } },
       }),
@@ -269,8 +250,6 @@ const packageWindows = (cli, options, version, info, release) => {
     join(ROOT, "scripts", "package-portable.ps1"),
     "-ExePath",
     exe,
-    "-NoticePath",
-    noticePath,
     "-Version",
     version,
     "-Arch",
