@@ -43,12 +43,14 @@ use crate::{
     platform::{core_events, hotkey},
 };
 
+mod image_ocr;
 mod overview;
 
 const WINDOW_MIN_SIZE: gpui::Size<gpui::Pixels> = size(px(960.), px(600.));
 
 struct PreferencesWindow {
     handle: AnyWindowHandle,
+    view: WeakEntity<Preferences>,
 }
 
 impl Global for PreferencesWindow {}
@@ -93,11 +95,14 @@ fn initial_tab() -> TabId {
 }
 
 pub(super) fn open(cx: &mut App) -> anyhow::Result<()> {
-    if let Some(handle) = cx
+    if let Some((handle, view)) = cx
         .try_global::<PreferencesWindow>()
-        .map(|window| window.handle)
+        .map(|window| (window.handle, window.view.clone()))
     {
-        let _ = handle.update(cx, |_, window, _| bring_window_to_front(window));
+        let _ = handle.update(cx, |_, window, cx| {
+            let _ = view.update(cx, |this, cx| this.refresh_image_ocr(cx));
+            bring_window_to_front(window);
+        });
         return Ok(());
     }
     let options = WindowOptions {
@@ -110,15 +115,21 @@ pub(super) fn open(cx: &mut App) -> anyhow::Result<()> {
         focus: false,
         ..Default::default()
     };
-    let (handle, _) = crate::platform::open_window(options, cx, |window, cx| {
+    let (handle, view) = crate::platform::open_window(options, cx, |window, cx| {
         let view = cx.new(|cx| Preferences::new(window, cx));
-        view.update(cx, |this, cx| this.refresh_storage_overview(cx));
+        view.update(cx, |this, cx| {
+            this.refresh_storage_overview(cx);
+            this.refresh_image_ocr(cx);
+        });
         crate::platform::reveal_after_first_frame(window, cx, |window, _| {
             bring_window_to_front(window);
         });
         view
     })?;
-    cx.set_global(PreferencesWindow { handle });
+    cx.set_global(PreferencesWindow {
+        handle,
+        view: view.downgrade(),
+    });
     let window_id = handle.window_id();
     cx.on_window_closed(move |cx, closed_id| {
         if closed_id == window_id {
@@ -140,16 +151,22 @@ pub(super) fn open_import(path: PathBuf, cx: &mut App) -> anyhow::Result<()> {
         focus: false,
         ..Default::default()
     };
-    let (handle, _) = crate::platform::open_window(options, cx, |window, cx| {
+    let (handle, view) = crate::platform::open_window(options, cx, |window, cx| {
         let view = cx.new(|cx| Preferences::new(window, cx));
-        view.update(cx, |this, cx| this.refresh_storage_overview(cx));
+        view.update(cx, |this, cx| {
+            this.refresh_storage_overview(cx);
+            this.refresh_image_ocr(cx);
+        });
         crate::platform::reveal_after_first_frame(window, cx, |window, _| {
             bring_window_to_front(window);
         });
         Preferences::show_import_confirmation(path.clone(), window, cx);
         view
     })?;
-    cx.set_global(PreferencesWindow { handle });
+    cx.set_global(PreferencesWindow {
+        handle,
+        view: view.downgrade(),
+    });
     let window_id = handle.window_id();
     cx.on_window_closed(move |cx, closed_id| {
         if closed_id == window_id {
@@ -193,6 +210,7 @@ struct Preferences {
     focus: FocusHandle,
     recording: Option<&'static str>,
     storage_overview: Option<StorageOverview>,
+    image_ocr: image_ocr::ImageOcrViewState,
     lan_state: Option<LanSyncState>,
     lan_code_hidden: bool,
     lan_name: TextInput,
@@ -506,6 +524,13 @@ impl Preferences {
         let subscriptions: Vec<Subscription> = core_events(cx)
             .map(|events| {
                 cx.subscribe(&events, |this, _, event: &CoreEvent, cx| {
+                    if let CoreEvent::SettingsUpdated { settings, .. } = event {
+                        this.settings = (**settings).clone();
+                        cx.notify();
+                    }
+                    if image_ocr::refresh_for_event(event) {
+                        this.refresh_image_ocr(cx);
+                    }
                     if matches!(
                         event,
                         CoreEvent::LanSyncChanged | CoreEvent::LanDevicePaired { .. }
@@ -557,6 +582,7 @@ impl Preferences {
             focus: cx.focus_handle(),
             recording: None,
             storage_overview: None,
+            image_ocr: image_ocr::ImageOcrViewState::default(),
             lan_state,
             lan_code_hidden: false,
             lan_name,
@@ -2357,6 +2383,9 @@ impl Preferences {
                         if id == TabId::Overview {
                             this.refresh_storage_overview(cx);
                         }
+                        if id == TabId::Capture {
+                            this.refresh_image_ocr(cx);
+                        }
                         cx.notify();
                     })),
             );
@@ -2581,6 +2610,7 @@ impl Preferences {
             })
             .into_any_element(),
             Control::StorageOverview => self.render_storage_overview(window, cx),
+            Control::ImageOcr => self.render_image_ocr(cx),
             Control::CaptureKinds => self.render_capture_kinds(value, cx),
             Control::CaptureOrder => self.render_capture_order(cx),
             Control::Retention => self.render_retention(cx),

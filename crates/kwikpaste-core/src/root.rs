@@ -63,6 +63,7 @@ pub(crate) struct CoreInner {
     pub(crate) watcher_pause: WatcherPause,
     /// 去重入库串行执行，见 [`clipboard::persist::store_and_emit`]。
     pub(crate) upsert_lock: tokio::sync::Mutex<()>,
+    pub(crate) ocr: crate::ocr::OcrRuntime,
     /// 快速粘贴进行中：上一次还没粘完时新的触发直接忽略，避免连按叠出多次粘贴。
     pub(crate) quick_paste_running: AtomicBool,
     platform: RwLock<Arc<dyn PlatformServices>>,
@@ -111,6 +112,7 @@ impl Core {
                 sync: crate::sync::LanSyncService::new(Arc::new(peers)),
                 watcher_pause: WatcherPause::default(),
                 upsert_lock: tokio::sync::Mutex::new(()),
+                ocr: Default::default(),
                 quick_paste_running: AtomicBool::new(false),
                 platform: RwLock::new(Arc::new(NoPlatformServices)),
                 clipboard_provider: RwLock::new(default_clipboard_provider()),
@@ -119,6 +121,7 @@ impl Core {
             });
 
             inner.sync.bind(Arc::downgrade(&inner));
+            crate::ocr::spawn(&inner);
             if let Err(err) = inner.apps.load_from_db(&inner).await {
                 log::warn!("apps registry: initial DB load failed: {err}");
             }
@@ -142,6 +145,7 @@ impl Core {
         drop(lock(&self.0.watcher).take());
         let core = self.clone();
         self.hop(async move {
+            crate::ocr::shutdown(&core.0).await;
             crate::sync::shutdown(&core.0).await;
             if let Some(task) = core.0.cleanup_task().take() {
                 task.abort();
@@ -222,6 +226,7 @@ impl Core {
 
     /// 暂停或恢复采集。暂停期间监听收到的变化直接丢弃（切换存储位置、覆盖导入备份时用）。
     pub fn set_capture_paused(&self, paused: bool) {
+        self.0.ocr.invalidate();
         self.0.watcher_pause.set_paused(paused);
     }
 
@@ -264,6 +269,7 @@ impl Core {
     pub async fn update_settings(&self, patch: serde_json::Value) -> Result<Settings> {
         let core = self.clone();
         self.hop(async move {
+            let _ocr = core.0.ocr.gate.lock().await;
             let delta = SettingsDelta::from_patch(&patch);
             let next = core.0.settings.update(patch)?;
             if delta.touches("clipboard.history") {
@@ -271,6 +277,9 @@ impl Core {
             }
             if delta.touches("sync") {
                 crate::sync::settings_changed(&core.0);
+            }
+            if delta.touches("clipboard.ocr") {
+                crate::ocr::settings_changed(&core.0);
             }
             core.emit_settings(&next, delta);
             Ok(next)
@@ -282,7 +291,9 @@ impl Core {
     pub async fn reset_settings(&self) -> Result<Settings> {
         let core = self.clone();
         self.hop(async move {
+            let _ocr = core.0.ocr.gate.lock().await;
             let next = core.0.settings.reset()?;
+            crate::ocr::settings_changed(&core.0);
             clipboard::cleanup::request(&core.0);
             crate::sync::settings_changed(&core.0);
             core.emit_settings(&next, SettingsDelta::replaced());
@@ -402,8 +413,14 @@ impl Core {
     ) -> Result<(Vec<ClipboardItem>, i64)> {
         let core = self.clone();
         self.hop(async move {
+            let _ocr = core.0.ocr.gate.lock().await;
             let pool = core.0.db.pool().await;
-            db::items::query_items_page(&pool, &query).await
+            db::items::query_items_page_with_ocr(
+                &pool,
+                &query,
+                core.settings().clipboard.ocr.enabled,
+            )
+            .await
         })
         .await
     }
@@ -413,8 +430,17 @@ impl Core {
     pub async fn list_items(&self, query: ClipboardItemQuery) -> Result<ClipboardItemPage> {
         let core = self.clone();
         self.hop(async move {
-            let pool = core.0.db.pool().await;
-            let (rows, total) = db::items::query_items_page(&pool, &query).await?;
+            let (pool, rows, total) = {
+                let _ocr = core.0.ocr.gate.lock().await;
+                let pool = core.0.db.pool().await;
+                let (rows, total) = db::items::query_items_page_with_ocr(
+                    &pool,
+                    &query,
+                    core.settings().clipboard.ocr.enabled,
+                )
+                .await?;
+                (pool, rows, total)
+            };
             let clipboard = core.0.settings.snapshot().clipboard;
             let ctx = core.list_context(&pool, &clipboard);
             let mut list = Vec::with_capacity(rows.len());
@@ -658,6 +684,98 @@ mod tests {
     use crate::clipboard::{MemoryClipboard, MemoryState};
     use crate::db::models::ClipboardKind;
     use crate::testing::{block_on, sample_png, Fixture};
+
+    #[test]
+    fn image_ocr_settings_preserve_explicit_choice_and_default_off() {
+        let defaults = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(defaults["clipboard"]["ocr"]["enabled"], false);
+        assert_eq!(defaults["clipboard"]["ocr"]["paused"], false);
+        let existing: Settings =
+            serde_json::from_value(json!({"clipboard":{"ocr":{"enabled":true,"paused":true}}}))
+                .unwrap();
+        let value = serde_json::to_value(existing).unwrap();
+        assert_eq!(value["clipboard"]["ocr"]["enabled"], true);
+        assert_eq!(value["clipboard"]["ocr"]["paused"], true);
+    }
+
+    #[test]
+    fn image_ocr_search_only_matches_when_enabled() {
+        let fixture = Fixture::new();
+        let core = fixture.start();
+        let image = MemoryClipboard::with_state(MemoryState {
+            png: Some(sample_png(20, 20)),
+            ..MemoryState::default()
+        });
+        let item = core
+            .build_item(&core.read_payload(&image).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        let id = block_on(core.store_item(item, None)).unwrap().id;
+        block_on(core.hop({
+            let core = core.clone();
+            async move {
+                let pool = core.0.db.pool().await;
+                sqlx::raw_sql("CREATE TABLE IF NOT EXISTS image_ocr(item_id TEXT PRIMARY KEY, token TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE VIRTUAL TABLE IF NOT EXISTS image_ocr_fts USING fts5(text, content='image_ocr', content_rowid='rowid', tokenize='trigram');").execute(&pool).await.unwrap();
+                sqlx::query("INSERT OR REPLACE INTO image_ocr VALUES (?, 'token', 'completed', '本地发票 local image invoice 100% A_B', '2026-01-01', '2026-01-01')").bind(id).execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO image_ocr_fts(image_ocr_fts) VALUES('rebuild')").execute(&pool).await.unwrap();
+                Ok(())
+            }
+        })).unwrap();
+        let query = ClipboardItemQuery {
+            keyword: Some("本地".into()),
+            ..Default::default()
+        };
+        assert_eq!(block_on(core.query_items_raw(query.clone())).unwrap().1, 0);
+        block_on(core.update_settings(json!({"clipboard":{"ocr":{"enabled":true,"paused":true}}})))
+            .unwrap();
+        for word in [
+            "本",
+            "本地",
+            "本地发票",
+            "local image",
+            "invoice",
+            "%",
+            "_",
+            "A_B",
+        ] {
+            let q = ClipboardItemQuery {
+                keyword: Some(word.into()),
+                ..Default::default()
+            };
+            let (rows, total) = block_on(core.query_items_raw(q.clone())).unwrap();
+            assert_eq!(total, 1, "OCR term {word}");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(block_on(core.list_item_refs(q.clone())).unwrap().len(), 1);
+            assert_eq!(
+                block_on(core.query_items_raw(ClipboardItemQuery {
+                    kind: Some(ClipboardKind::Text),
+                    ..q
+                }))
+                .unwrap()
+                .1,
+                0
+            );
+        }
+        let missing = ClipboardItemQuery {
+            keyword: Some("missing literal".into()),
+            ..Default::default()
+        };
+        assert_eq!(block_on(core.query_items_raw(missing)).unwrap().1, 0);
+        block_on(core.update_settings(json!({"clipboard":{"ocr":{"enabled":false}}}))).unwrap();
+        assert_eq!(block_on(core.query_items_raw(query)).unwrap().1, 0);
+        let image_id = block_on(core.query_items_raw(ClipboardItemQuery::default()))
+            .unwrap()
+            .0[0]
+            .id
+            .clone();
+        block_on(core.update_note(&image_id, Some("保留备注 invoice".into()))).unwrap();
+        let note = ClipboardItemQuery {
+            keyword: Some("invoice".into()),
+            ..Default::default()
+        };
+        assert_eq!(block_on(core.query_items_raw(note)).unwrap().1, 1);
+        block_on(core.shutdown()).unwrap();
+    }
 
     /// 测试线程上没有 tokio 上下文，每个公开方法都直接在自制执行器里 await。
     #[test]

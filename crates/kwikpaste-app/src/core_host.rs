@@ -65,6 +65,14 @@ pub fn start() -> anyhow::Result<StartedCore> {
     ))
     .context("kwikpaste-core did not start")?;
     core.set_platform_services(Arc::new(NativeServices));
+    // Windows 的离线模型在开始采集前校验并初始化，数据目录用于保存随附许可说明。
+    let ocr_configuration = core
+        .paths()
+        .app_data_dir()
+        .and_then(|data_dir| core.configure_image_ocr_models(&data_dir.join("ocr-components")));
+    if let Err(error) = ocr_configuration {
+        log::warn!("offline image OCR is unavailable: {error:#}");
+    }
     // 自测进程不读写本机剪贴板，也不监听；只有真机剪贴板探针（`--selftest-real-clipboard`）例外。
     let real_clipboard =
         !crate::selftest::active() || crate::selftest::enabled(crate::selftest::REAL_CLIPBOARD);

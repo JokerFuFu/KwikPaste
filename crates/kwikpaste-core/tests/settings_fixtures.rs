@@ -138,6 +138,11 @@ fn customized_settings_round_trip_exactly() {
     expected["shortcuts"]["pauseInFullscreen"] = Value::Bool(true);
     expected["shortcuts"]["pauseAppIds"] = Value::Array(Vec::new());
     expected["shortcuts"]["pastePlain"] = Value::String(String::new());
+    expected["clipboard"]
+        .as_object_mut()
+        .unwrap()
+        .entry("ocr")
+        .or_insert_with(|| serde_json::json!({"enabled": false, "paused": false}));
     // 2.x 删掉了 1.x 的更新渠道开关。
     let update = expected["update"].as_object_mut().unwrap();
     update.remove("includeBeta");
@@ -166,6 +171,40 @@ fn customized_settings_round_trip_exactly() {
     .unwrap();
     assert_eq!(reread, saved);
     assert_eq!(reread.clipboard, store.snapshot().clipboard);
+}
+
+#[test]
+fn image_ocr_defaults_and_explicit_choices_survive_legacy_settings_save() {
+    let content = fs::read_to_string(fixtures_dir().join("v1.4.0-customized.json")).unwrap();
+    for choice in [
+        None,
+        Some(serde_json::json!({"enabled": true})),
+        Some(serde_json::json!({"paused": true})),
+        Some(serde_json::json!({"enabled": true, "paused": true})),
+        Some(serde_json::json!({"enabled": false, "paused": true})),
+    ] {
+        let mut original: Value = serde_json::from_str(&content).unwrap();
+        if let Some(choice) = choice {
+            original["clipboard"]["ocr"] = choice;
+        }
+        let expected_enabled = original["clipboard"]["ocr"]["enabled"]
+            .as_bool()
+            .unwrap_or(false);
+        let expected_paused = original["clipboard"]["ocr"]["paused"]
+            .as_bool()
+            .unwrap_or(false);
+        let original = original.to_string();
+        let (_temp, paths, store) = load(&original);
+        let path = paths.config_dir().unwrap().join("settings.json");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let saved = store
+            .update(serde_json::json!({"appearance": {"theme": "light"}}))
+            .unwrap();
+        let reread: Settings = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(reread, saved);
+        assert_eq!(reread.clipboard.ocr.enabled, expected_enabled);
+        assert_eq!(reread.clipboard.ocr.paused, expected_paused);
+    }
 }
 
 #[test]

@@ -41,6 +41,8 @@ pub enum ListUpdate {
     Cleaned { removed: u64 },
     /// 历史数据整体换了一份：导入备份、切换存储位置（core `ClipboardReloaded`，1.x `imported`）。
     Reloaded,
+    /// 图片派生索引或其搜索开关变化，不伪造剪贴板记录 id。
+    SearchIndexChanged,
 }
 
 /// 收到列表变化后要做的事。
@@ -50,7 +52,7 @@ pub enum UpdateAction {
     Ignore,
     /// 已在顶部：立即重拉第一页。
     ReloadNow {
-        /// 同时清掉当前选中（清理、导入时）。
+        /// 清空批量勾选并作废异步选择结果；当前项光标由控制器独立处理。
         reset_selection: bool,
     },
     /// 不在顶部或面板隐藏：记成挂起，回到顶部再刷新。
@@ -205,6 +207,13 @@ impl ListController {
 
     /// 列表变化的处理决定（1.x `handleClipboardUpdated` + `requestReloadAtTop`）。
     pub fn on_update(&mut self, update: ListUpdate, visible: bool, at_top: bool) -> UpdateAction {
+        if update == ListUpdate::SearchIndexChanged {
+            // 索引关闭或清除会让命中消失，正在浏览和隐藏的窗口都必须及时重查当前过滤条件。
+            self.pending_reload = false;
+            return UpdateAction::ReloadNow {
+                reset_selection: true,
+            };
+        }
         let reset_selection = match update {
             ListUpdate::Cleaned { .. } | ListUpdate::Reloaded => true,
             ListUpdate::Upserted { kind, .. } => {
@@ -213,6 +222,7 @@ impl ListController {
                 }
                 false
             }
+            ListUpdate::SearchIndexChanged => true,
         };
         if reset_selection {
             self.selected = None;
@@ -514,6 +524,81 @@ mod tests {
     }
 
     #[test]
+    fn image_ocr_membership_change_clears_checked_rows_and_rejects_pending_select_all() {
+        use super::super::selection::Selection;
+
+        let mut model = ListModel::new();
+        let request = model.reset_and_reload();
+        let images = ["r0", "r1"]
+            .into_iter()
+            .map(|id| {
+                let mut image = item(id, false);
+                Arc::make_mut(&mut image).kind = ItemKind::Image;
+                image
+            })
+            .collect();
+        model.apply(
+            &request,
+            Page {
+                items: images,
+                total: 2,
+            },
+        );
+        let mut controller = ListController::new();
+        controller.set_filter(ListFilter {
+            category: Some(ItemKind::Image),
+            keyword: "ocr-only".into(),
+            ..ListFilter::default()
+        });
+        controller.select(&"r0".into());
+        let mut selection = Selection::default();
+        selection.enter();
+        let pending_token = selection.token();
+        assert!(selection.check_all_if_current(pending_token, ["r0".into(), "r1".into()]));
+
+        let action = controller.on_update(ListUpdate::SearchIndexChanged, true, false);
+        if matches!(
+            action,
+            UpdateAction::ReloadNow {
+                reset_selection: true
+            }
+        ) {
+            selection.reset();
+        }
+        let request = model.reload();
+        model.apply(
+            &request,
+            Page {
+                items: Vec::new(),
+                total: 0,
+            },
+        );
+
+        assert_eq!(model.total(), 0, "OCR-only rows no longer match");
+        assert!(
+            selection.ids().is_empty(),
+            "bulk delete must not retain invisible originals"
+        );
+        assert_ne!(
+            selection.token(),
+            pending_token,
+            "pending select-all must be invalidated"
+        );
+        assert!(!selection.check_all_if_current(pending_token, ["r0".into(), "r1".into()]));
+        assert_eq!(
+            selection.count(),
+            0,
+            "late select-all cannot restore checked ids"
+        );
+        assert!(selection.active(), "multi-select mode can remain open");
+        assert_eq!(
+            controller.selected().map(|id| &**id),
+            Some("r0"),
+            "cursor selection is independent"
+        );
+    }
+
+    #[test]
     fn cleanup_and_import_reset_the_selection() {
         let mut controller = ListController::new();
         controller.hover(&"r1".into());
@@ -563,5 +648,28 @@ mod tests {
         controller.on_shown();
 
         assert!(controller.selected().is_none());
+    }
+
+    #[test]
+    fn image_ocr_change_refreshes_filtered_visible_and_hidden_lists_immediately() {
+        for (visible, at_top) in [(true, false), (true, true), (false, false)] {
+            let mut controller = ListController::new();
+            let filter = ListFilter {
+                range: crate::clipboard::model::filter::Range::Favorite,
+                category: Some(ItemKind::Image),
+                ..ListFilter::default()
+            };
+            controller.set_filter(filter.clone());
+            controller.hover(&"image-1".into());
+            assert_eq!(
+                controller.on_update(ListUpdate::SearchIndexChanged, visible, at_top),
+                UpdateAction::ReloadNow {
+                    reset_selection: true
+                }
+            );
+            assert_eq!(controller.filter(), &filter);
+            assert_eq!(controller.selected().map(|id| &**id), Some("image-1"));
+            assert!(!controller.has_pending_reload());
+        }
     }
 }

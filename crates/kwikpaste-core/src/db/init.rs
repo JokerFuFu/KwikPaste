@@ -22,7 +22,7 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// 已发布（含 2.0 新增）迁移的 sha384：LF 是 macOS 检出的字节，CRLF 是 Windows 检出的字节。
 /// 用户库的 `_sqlx_migrations` 里存的就是这两种之一，对不上的话存量用户启动即失败；
 /// 跨平台覆盖导入备份时按这张表换算（[`adopt_published_checksums`]）。新增迁移要在这里补上两种值。
-pub(crate) const PUBLISHED: [(i64, &str, &str); 7] = [
+pub(crate) const PUBLISHED: [(i64, &str, &str); 8] = [
     (
         1,
         "bfa656aa68eed66f8dab5bacb9efa4bafeb11713fd417239e05f7b4c5757330fae5eafeeb138771c6d18785670c44b05",
@@ -58,6 +58,7 @@ pub(crate) const PUBLISHED: [(i64, &str, &str); 7] = [
         "0766fc81a02997e2e9aa5d5b63be0e2d3371a5c08377c5f7e8c67277361706dc91399874fc65df55de3c3529d8c614ed",
         "1362c23e2e06f89ea2e0265702cd12c7e69722fc3890562108970452a205a25a15d27318778fb10aae41a5e9ba293fbe",
     ),
+    (8, "7dda1a0877cddd410657f66cfbd35e3ba1d50f5fcee21f8390902077ca66516a8eef52164acbc67e4de315d2c34f95b5", "2a60b92a1a78742cad7435e7e2b26264f3ce05f28fd502d9e6e6e6ebd5bb08ec9f1d6d580d93a39b136ab42afcc35cbc"),
 ];
 
 /// 把另一个平台写下的已发布迁移校验和改成本平台的值，返回改了几条。
@@ -156,6 +157,80 @@ mod tests {
 
     use super::*;
     use crate::env::AppEnv;
+
+    #[tokio::test]
+    async fn image_ocr_migration_adopts_legacy_and_clean_databases_without_rewriting_history() {
+        for legacy in [false, true] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .in_memory(true)
+                        .foreign_keys(true),
+                )
+                .await
+                .unwrap();
+            for migration in MIGRATOR.iter().filter(|m| m.version <= 7) {
+                sqlx::raw_sql(migration.sql.clone())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("INSERT INTO clipboard_items(id,kind,content,content_hash,platform,is_favorite,is_pinned,note,created_at,updated_at) VALUES('original','image','original.png','hash','macos',1,1,'保留备注','2026-01-01','2026-01-02')").execute(&pool).await.unwrap();
+            let before: (String, String, String, bool, bool, String, String) = sqlx::query_as("SELECT content,content_hash,note,is_favorite,is_pinned,created_at,updated_at FROM clipboard_items").fetch_one(&pool).await.unwrap();
+            let schema: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                sqlx::query_as("PRAGMA table_info(clipboard_items)")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            if legacy {
+                sqlx::raw_sql("CREATE TABLE image_ocr(item_id TEXT PRIMARY KEY NOT NULL REFERENCES clipboard_items(id) ON DELETE CASCADE,token TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','completed','failed')),text TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE VIRTUAL TABLE image_ocr_fts USING fts5(text,content='image_ocr',content_rowid='rowid',tokenize='trigram'); INSERT INTO image_ocr VALUES('original','oldtoken','completed','legacy invoice 保留发票','2026-01-01','2026-01-02'); INSERT INTO image_ocr_fts(image_ocr_fts) VALUES('rebuild');").execute(&pool).await.unwrap();
+            }
+            let migration = MIGRATOR
+                .iter()
+                .find(|m| m.version == 8)
+                .expect("OCR adoption migration missing");
+            for _ in 0..2 {
+                sqlx::raw_sql(migration.sql.clone())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let after = sqlx::query_as::<_, (String, String, String, bool, bool, String, String)>("SELECT content,content_hash,note,is_favorite,is_pinned,created_at,updated_at FROM clipboard_items").fetch_one(&pool).await.unwrap();
+            assert_eq!(before, after);
+            let after_schema =
+                sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(
+                    "PRAGMA table_info(clipboard_items)",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(schema, after_schema);
+            if legacy {
+                let row: (String, String, String) =
+                    sqlx::query_as("SELECT token,status,text FROM image_ocr")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    row,
+                    (
+                        "oldtoken".into(),
+                        "completed".into(),
+                        "legacy invoice 保留发票".into()
+                    )
+                );
+                let hits: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM image_ocr_fts WHERE image_ocr_fts MATCH 'invoice'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(hits, 1);
+            }
+            pool.close().await;
+        }
+    }
 
     #[test]
     fn published_migrations_keep_released_checksums() {
